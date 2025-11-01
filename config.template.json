@@ -23,11 +23,16 @@
   "duel_summary_file": "./public/data/duel_summary.json",
 
   /* 🌐 BACKEND ENDPOINTS */
-  "api_base": "https://duel-bot-backend-production.up.railway.app",
-  "duel_backend_base_url": "https://duel-bot-backend-production.up.railway.app",
+  "api_base": "https://duel-bot-production.up.railway.app",
+  /* ✅ NEW: persistent-data service that serves /me/:token/* */
+  "me_base": "https://sv13-tcg-data-production.up.railway.app",
+  "duel_backend_base_url": "https://duel-bot-production.up.railway.app",
   "frontend_url": "https://madv313.github.io/",
   "ui_base": "https://madv313.github.io/",
   "pass_api_query": false,
+
+  /* 🖼️ IMAGE BASE (used by UIs as default imgbase=) */
+  "image_base": "https://madv313.github.io/Card-Collection-UI/images/cards",
 
   /* 🎴 UI ROUTES */
   "ui_urls": {
@@ -82,5 +87,5 @@
   "project_name": "SV13 CCG Duel Bot Backend",
   "version": "1.2.0",
   "maintainer": "SV13 Development Team",
-  "last_updated": "2025-10-19"
+  "last_updated": "2025-11-01"
 }
