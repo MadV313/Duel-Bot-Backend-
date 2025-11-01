@@ -114,6 +114,16 @@ export const config = {
     ''
   ),
 
+  // 👉 NEW: base for /me/:token/* endpoints (persistent-data service)
+  // Set ME_BASE (or me_base / PERSISTENT_DATA_BASE) to e.g.:
+  //   https://sv13-tcg-data-production.up.railway.app
+  me_base: trimTrailingSlash(
+    process.env.ME_BASE ||
+    process.env.me_base ||
+    process.env.PERSISTENT_DATA_BASE ||
+    ''
+  ),
+
   // Optional absolute base for card images (front-end CDN/public)
   image_base:
     trimTrailingSlash(process.env.IMAGE_BASE || process.env.image_base || 'https://madv313.github.io/Card-Collection-UI/images/cards'),
@@ -158,6 +168,7 @@ export const rarityWeights = {
 
 /** Convenience passthroughs used around the codebase (stays stable). */
 export const api_base = config.api_base;
+export const me_base = config.me_base;              // ← NEW export
 export const image_base = config.image_base;
 export const image_base_fallbacks = config.image_base_fallbacks;
 export const card_back_filename = config.card_back_filename;
