@@ -126,7 +126,7 @@ function countInitiationsToday(tradesObj = {}, initiatorId, day = todayStr()) {
 
 // Build a Collection UI link following the UI/cog contract:
 // ?mode=trade&tradeSession=<id>&role=<initiator|partner>[&stage=...&partner=...]
-function buildUiLink({ base, token, apiBase, sessionId, role, stage, partnerName }) {
+function buildUiLink({ base, token, apiBase, meBase, sessionId, role, stage, partnerName }) {
   const ts = Date.now();
   const qp = new URLSearchParams();
   qp.set('mode', 'trade');
@@ -134,6 +134,7 @@ function buildUiLink({ base, token, apiBase, sessionId, role, stage, partnerName
   if (role) qp.set('role', role);
   if (token) qp.set('token', token);
   if (apiBase) qp.set('api', apiBase);
+  if (meBase) qp.set('me', meBase);
   if (stage) qp.set('stage', stage);
   if (partnerName) qp.set('partner', partnerName);
   qp.set('ts', String(ts));
@@ -274,6 +275,7 @@ export default function createTradeRouter(bot) {
         initiatorId: initiatorIdRaw,
         partnerId: partnerIdRaw,
         apiBase,
+        meBase,              // ✅ NEW: allow caller to pass ME base
         collectionUiBase
       } = req.body || {};
 
@@ -355,7 +357,7 @@ export default function createTradeRouter(bot) {
         createdAt: now.toISOString(),
         expiresAt: new Date(now.getTime() + SESSION_TTL_HOURS*3600*1000).toISOString(),
         status: 'active',           // active | accepted | denied | expired
-        stage: 'pickMine',          // pickMine → pickTheirs → decision
+        stage: 'pickMine',          // pickMine → pickTheirs → decision (initiator picks both sides; partner decides)
         initiator: {
           userId: initiatorId,
           token: iniToken,
@@ -367,7 +369,10 @@ export default function createTradeRouter(bot) {
           token: parToken,
           name: parProfile.discordName || partnerId,
           selection: [],            // up to 3 (ids)
-        }
+        },
+        // ✅ store bases for consistent deep-links
+        apiBase: apiBase || process.env.API_BASE || process.env.api_base || '',
+        meBase:  meBase  || process.env.ME_BASE || process.env.me_base  || '',
       };
 
       // Persist session
@@ -391,7 +396,8 @@ export default function createTradeRouter(bot) {
       const initLink = buildUiLink({
         base: uiBase,
         token: iniToken,
-        apiBase,
+        apiBase: session.apiBase,   // ✅ use stored
+        meBase:  session.meBase,    // ✅ include me=
         sessionId,
         role: 'initiator',
         stage: 'pickMine',
@@ -588,11 +594,13 @@ export default function createTradeRouter(bot) {
           const uiBase = (process.env.COLLECTION_UI_BASE ||
             process.env.COLLECTION_UI ||
             'https://madv313.github.io/Card-Collection-UI');
-          const apiBase = process.env.API_BASE || process.env.api_base || '';
+          const apiBase = s.apiBase || process.env.API_BASE || process.env.api_base || '';
+          const meBase  = s.meBase  || process.env.ME_BASE || process.env.me_base  || '';
           const partnerLink = buildUiLink({
             base: uiBase,
             token: s.partner.token,
             apiBase,
+            meBase,
             sessionId: s.id,
             role: 'partner',
             stage: 'pickTheirs',
@@ -630,11 +638,13 @@ export default function createTradeRouter(bot) {
           const uiBase = (process.env.COLLECTION_UI_BASE ||
             process.env.COLLECTION_UI ||
             'https://madv313.github.io/Card-Collection-UI');
-          const apiBase = process.env.API_BASE || process.env.api_base || '';
+          const apiBase = s.apiBase || process.env.API_BASE || process.env.api_base || '';
+          const meBase  = s.meBase  || process.env.ME_BASE || process.env.me_base  || '';
           const partnerLink = buildUiLink({
             base: uiBase,
             token: s.partner.token,
             apiBase,
+            meBase,
             sessionId: s.id,
             role: 'partner',
             stage: 'decision',
