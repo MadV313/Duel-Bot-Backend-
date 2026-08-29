@@ -1,250 +1,102 @@
-// routes/duel.js
 import express from 'express';
-import fs from 'fs/promises';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { startPracticeDuel, duelState } from '../logic/duelState.js';
-import { applyBotMove } from '../logic/botHandler.js';
+import { getSpectatorCount } from '../logic/chatRegistry.js';
+import { PlayerLinks } from '../utils/playerLinks.js';
+import { getPlayerProfileByUserId, resolveUserIdByToken } from '../utils/deckUtils.js';
+import { applyAction, applyBotTurn, applyTrustedSnapshot } from '../logic/duelActions.js';
+import { createChallengeSession, createPracticeSession, decideChallenge, finalizeSession, getSession, listSessions, resolveSeat, serializePlayer, serializeSpectator } from '../logic/duelSessions.js';
 
-// NEW: session registry
-import {
-  upsertSession,
-  setSessionStateProvider,
-  listActiveSessions,
-  getSessionState,
-  getSpectatorCountForSession, // 👈 additive (safe)
-} from '../logic/duelRegistry.js';
+const router = express.Router();
+export const botAlias = express.Router();
+const botKey = () => String(process.env.BOT_API_KEY || process.env.BOT_KEY || '');
+const keyFrom = req => String(req.get('X-Bot-Key') || req.get('Authorization')?.replace(/^Bearer\s+/i,'') || '');
+const protectedBot = (req,res,next) => { const expected=botKey(); if (!expected) return res.status(503).json({error:'BOT_API_KEY is not configured'}); if (keyFrom(req)!==expected) return res.status(401).json({error:'Unauthorized'}); next(); };
+const sendError = (res,e) => res.status(e?.status || 500).json({ error: e?.message || 'Internal error' });
 
-const router = express.Router();          // mounted at /duel
-export const botAlias = express.Router(); // mounted at /bot
+router.get('/status', (_req,res) => res.json({ ok:true, engine:'DuelSession', version:1 }));
 
-// ────────────────────────────────────────────────────────────
-// Resolve CoreMasterReference.json (cache it after first read)
-// ────────────────────────────────────────────────────────────
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
-const CORE_PATH  = path.resolve(__dirname, '../logic/CoreMasterReference.json');
-
-let cardsCache = null;
-async function loadCoreCards() {
-  if (cardsCache) return cardsCache;
-  const raw = await fs.readFile(CORE_PATH, 'utf-8');
-  cardsCache = JSON.parse(raw);
-  console.log(
-    `📦 Loaded ${Array.isArray(cardsCache) ? cardsCache.length : 0} cards from CoreMasterReference.`
-  );
-  return cardsCache;
-}
-
-// ────────────────────────────────────────────────────────────
-/* Handlers */
-// ────────────────────────────────────────────────────────────
-async function startPracticeHandler(req, res) {
-  const traceId =
-    req.headers['x-trace-id'] ||
-    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
+async function practiceHandler(req,res) {
   try {
-    const cards = await loadCoreCards();
-    startPracticeDuel(cards); // sets global duelState (200 HP, draw 3, coin flip)
-
-    // reflect the practice duel into the session registry
-    const sessionId = 'practice';
-    upsertSession({
-      id: sessionId,
-      status: 'live',
-      isPractice: true,
-      players: [
-        { userId: '',    name: 'Player' },
-        { userId: 'bot', name: 'Practice Bot' },
-      ],
-    });
-    setSessionStateProvider(sessionId, () => duelState);
-
-    console.log(
-      `[duel] practice.init ${JSON.stringify({
-        t: new Date().toISOString(),
-        traceId,
-        ip: req.ip,
-        mode: duelState.duelMode,
-        currentPlayer: duelState.currentPlayer,
-      })}`
-    );
-
-    // Include a non-breaking spectatorCount for clients that surface it
-    const out = {
-      ...duelState,
-      spectatorCount: Number(getSpectatorCountForSession?.(sessionId) || 0),
-    };
-
-    res.set('Cache-Control', 'no-store');
-    res.json(out);
-  } catch (err) {
-    console.error(
-      `[duel] practice.error ${JSON.stringify({
-        t: new Date().toISOString(),
-        traceId,
-        error: String(err?.message || err),
-      })}`
-    );
-    res.status(500).json({
-      error: 'Failed to start practice duel',
-      details: String(err?.message || err),
-      traceId,
-    });
-  }
+    const token = String(req.body?.token || req.query?.token || '');
+    const userId = await resolveUserIdByToken(token);
+    if (!userId) return res.status(401).json({ error:'Invalid player token' });
+    const profile = await getPlayerProfileByUserId(userId);
+    const deckMode = String(req.body?.deckMode || req.body?.practiceDeck || req.query?.deckMode || 'random').toLowerCase() === 'saved' ? 'saved' : 'random';
+    const session = await createPracticeSession({ userId, token, displayName: profile?.discordName, deckMode });
+    res.status(201).json({ ok:true, sessionId:session.id, mode:session.mode, status:session.status, url:PlayerLinks.duel(session.id,token), spectatorUrl:PlayerLinks.spectator(session.id) });
+  } catch(e) { sendError(res,e); }
 }
+router.post('/practice', practiceHandler);
+botAlias.post('/practice', practiceHandler);
+botAlias.get('/practice', (_req,res) => res.status(410).json({ error:'Legacy global practice initialization retired. POST /duel/practice with the player token.' }));
 
-async function botTurnHandler(req, res) {
-  const traceId =
-    req.headers['x-trace-id'] ||
-    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
+router.post('/start', protectedBot, async (req,res) => {
   try {
-    console.log(
-      `[duel] bot.turn.request ${JSON.stringify({
-        t: new Date().toISOString(),
-        traceId,
-      })}`
-    );
+    const { challengerId, opponentId } = req.body || {};
+    const [p1,p2] = await Promise.all([getPlayerProfileByUserId(String(challengerId||'')),getPlayerProfileByUserId(String(opponentId||''))]);
+    if (!p1?.token || !p2?.token) return res.status(400).json({error:'Both players must be linked.'});
+    const session = await createChallengeSession({ challengerId:String(challengerId), challengerToken:p1.token, challengerName:p1.discordName, opponentId:String(opponentId), opponentToken:p2.token, opponentName:p2.discordName });
+    res.status(201).json({ ok:true, sessionId:session.id, status:session.status, challengerUrl:PlayerLinks.duel(session.id,p1.token), opponentUrl:PlayerLinks.duel(session.id,p2.token), spectatorUrl:PlayerLinks.spectator(session.id) });
+  } catch(e){ sendError(res,e); }
+});
 
-    // ✅ mutate the real global state, not req.body
-    const updated = await applyBotMove(duelState);
+router.post('/:session/decision', async (req,res) => {
+  try { const s=await decideChallenge(req.params.session,String(req.body?.token||''),req.body?.decision); res.json({ok:true,sessionId:s.id,status:s.status}); }
+  catch(e){ sendError(res,e); }
+});
 
-    // (optional) refresh "practice" session updatedAt later if needed
-
-    console.log(
-      `[duel] bot.turn.ok ${JSON.stringify({
-        t: new Date().toISOString(),
-        traceId,
-        currentPlayer: updated?.currentPlayer,
-      })}`
-    );
-
-    res.set('Cache-Control', 'no-store');
-    res.json(updated);
-  } catch (err) {
-    console.error(
-      `[duel] bot.turn.error ${JSON.stringify({
-        t: new Date().toISOString(),
-        traceId,
-        error: String(err?.message || err),
-      })}`
-    );
-    res.status(500).json({
-      error: 'Bot move failed',
-      details: String(err?.message || err),
-      traceId,
-    });
-  }
-}
-
-function statusHandler(_req, res) {
-  res.set('Cache-Control', 'no-store');
-  res.json({
-    ok: true,
-    mode: duelState.duelMode || 'none',
-    currentPlayer: duelState.currentPlayer || null,
-    startedAt: duelState.startedAt || null,
-  });
-}
-
-// ────────────────────────────────────────────────────────────
-// NEW: /duel/sync — mirror client snapshot for spectator
-// (guarded merge: only fields spectators need to see)
-// ────────────────────────────────────────────────────────────
-function syncHandler(req, res) {
+router.get('/active', async (_req,res) => {
   try {
-    const s = req.body?.players;
-    if (!s?.player1 || !s?.bot) {
-      return res.status(400).json({ error: 'bad payload' });
-    }
+    const rows=await listSessions({activeOnly:true});
+    res.json(rows.map(row => ({ id:row.id,mode:row.mode,status:row.status,revision:row.revision,createdAt:row.createdAt,updatedAt:row.updatedAt,players:(row.players||[]).map(p=>({displayName:p.displayName,controller:p.controller})) })));
+  } catch(e){ sendError(res,e); }
+});
 
-    // HP
-    duelState.players.player1.hp = Number(s.player1.hp ?? duelState.players.player1.hp);
-    duelState.players.bot.hp     = Number(s.bot.hp ?? duelState.players.bot.hp);
+router.get('/:session/state', async (req,res) => {
+  try {
+    const s=await getSession(req.params.session); if(!s) return res.status(404).json({error:'Session not found'});
+    const token=String(req.query?.token||req.get('X-Player-Token')||'');
+    const view=serializePlayer(s,token,getSpectatorCount(s.id));
+    if(!view) return res.status(401).json({error:'Invalid player token'});
+    res.set('Cache-Control','no-store').json(view);
+  } catch(e){ sendError(res,e); }
+});
 
-    // Field
-    if (Array.isArray(s.player1.field)) duelState.players.player1.field = s.player1.field;
-    if (Array.isArray(s.bot.field))     duelState.players.bot.field     = s.bot.field;
+router.get('/:session/spectator', async (req,res) => {
+  try { const s=await getSession(req.params.session); if(!s) return res.status(404).json({error:'Session not found'}); res.set('Cache-Control','no-store').json(serializeSpectator(s,getSpectatorCount(s.id))); }
+  catch(e){ sendError(res,e); }
+});
 
-    // Discard piles
-    if (Array.isArray(s.player1.discardPile)) duelState.players.player1.discardPile = s.player1.discardPile;
-    if (Array.isArray(s.bot.discardPile))     duelState.players.bot.discardPile     = s.bot.discardPile;
+router.post('/:session/action', async (req,res) => {
+  try { const result=await applyAction(req.params.session,String(req.body?.token||''),req.body?.action,req.body?.parameters||{}); res.json({ok:true,revision:result.session.revision,state:result.view}); }
+  catch(e){ sendError(res,e); }
+});
+router.post('/:session/bot-turn', async (req,res) => {
+  try { const s=await applyBotTurn(req.params.session,String(req.body?.token||'')); res.json({ok:true,revision:s.revision,state:serializePlayer(s,String(req.body?.token||''),getSpectatorCount(s.id))}); }
+  catch(e){ sendError(res,e); }
+});
 
-    // (optional) hands / decks for accurate counts
-    if (Array.isArray(s.player1.hand)) duelState.players.player1.hand = s.player1.hand;
-    if (Array.isArray(s.bot.hand))     duelState.players.bot.hand     = s.bot.hand;
-    if (Array.isArray(s.player1.deck)) duelState.players.player1.deck = s.player1.deck;
-    if (Array.isArray(s.bot.deck))     duelState.players.bot.deck     = s.bot.deck;
+router.post('/:session/sync', protectedBot, async (req,res) => {
+  try { const s=await applyTrustedSnapshot(req.params.session,req.body?.state||req.body||{}); res.json({ok:true,revision:s.revision,status:s.status}); }
+  catch(e){ sendError(res,e); }
+});
+router.post('/:session/finalize', protectedBot, async (req,res) => {
+  try { const out=await finalizeSession(req.params.session); res.json({ok:true,summaryId:out.summary.sessionId,summary:out.summary}); }
+  catch(e){ sendError(res,e); }
+});
 
-    // Turn indicator (optional)
-    if (typeof req.body.currentPlayer === 'string') {
-      duelState.currentPlayer = req.body.currentPlayer;
-    }
-
-    // (optional) startedAt remains as-in unless you want to update
-
-    res.set('Cache-Control', 'no-store');
-    return res.json({ ok: true, state: duelState });
-  } catch (e) {
-    return res.status(500).json({ error: 'sync failed', details: String(e) });
-  }
-}
-
-// ────────────────────────────────────────────────────────────
-// NEW: multi-lobby endpoints (non-breaking)
-// ────────────────────────────────────────────────────────────
-
-// List all currently active sessions (practice + any future PvP)
-function listActiveHandler(_req, res) {
-  const list = listActiveSessions();
-  res.set('Cache-Control', 'no-store');
-  res.json({ duels: list });
-}
-
-// Return duel state; supports ?session=... (falls back to global practice for backward-compat)
-// Adds spectatorCount (server-truth) when possible so Spectator UI doesn't show 0.
-function stateHandler(req, res) {
-  const sessionId = String(req.query.session || '').trim();
-
-  if (sessionId) {
-    const state = getSessionState(sessionId);
-    if (state) {
-      const out = {
-        ...state,
-        spectatorCount: Number(getSpectatorCountForSession?.(sessionId) || 0),
-      };
-      res.set('Cache-Control', 'no-store');
-      return res.json(out);
-    }
-    res.set('Cache-Control', 'no-store');
-    return res.status(404).json({ error: 'Session not found', session: sessionId });
-  }
-
-  // Backward-compat: no session param returns the global duelState
-  const out = {
-    ...duelState,
-    spectatorCount: Number(getSpectatorCountForSession?.('practice') || 0),
-  };
-  res.set('Cache-Control', 'no-store');
-  return res.json(out);
-}
-
-// ────────────────────────────────────────────────────────────
-router.get('/status', statusHandler);
-botAlias.get('/status', statusHandler);
-
-router.get('/practice', startPracticeHandler);     // /duel/practice
-botAlias.get('/practice', startPracticeHandler);   // /bot/practice
-
-router.post('/turn', botTurnHandler);              // /duel/turn
-
-// NEW
-router.post('/sync', syncHandler);                 // /duel/sync
-
-// NEW (non-breaking additions)
-router.get('/active', listActiveHandler);          // /duel/active
-router.get('/state', stateHandler);                // /duel/state[?session=...]
+// Compatibility endpoints require an explicit session and never fall back to unrelated global state.
+router.get('/state', async (req,res) => {
+  try {
+    const id=String(req.query?.session||''); if(!id) return res.status(400).json({error:'session is required'});
+    const s=await getSession(id); if(!s) return res.status(404).json({error:'Session not found'});
+    const token=String(req.query?.token||req.get('X-Player-Token')||'');
+    if (token) { const view=serializePlayer(s,token,getSpectatorCount(id)); if(!view)return res.status(401).json({error:'Invalid player token'}); return res.json(view); }
+    return res.json(serializeSpectator(s,getSpectatorCount(id)));
+  } catch(e){ sendError(res,e); }
+});
+router.get('/current', async (req,res) => {
+  try { const id=String(req.query?.session||''); if(!id) return res.status(400).json({error:'session is required'}); const s=await getSession(id); if(!s) return res.status(404).json({error:'Session not found'}); res.json(serializeSpectator(s,getSpectatorCount(id))); }
+  catch(e){ sendError(res,e); }
+});
 
 export default router;

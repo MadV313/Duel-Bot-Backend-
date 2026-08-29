@@ -19,36 +19,27 @@ import {
   resolveUserIdByToken,
   pad3,
 } from '../utils/deckUtils.js';
-import { load_file, save_file } from '../utils/storageClient.js';
+import { PATHS, loadJSON, updateJSONAtomic } from '../utils/storageClient.js';
+import { config, UI } from '../utils/config.js';
+import { applyCardExchange, normalizeTradeSelection } from '../utils/tradeCore.js';
+import { countTradeInitiationsToday, getTradeLimitStatus, utcTradeDay } from '../utils/tradeLimits.js';
 
-// ✅ NEW: for decision receipts w/ thumbnails
+// Decision receipts keep the original rich card-thumbnail behavior.
 import { EmbedBuilder } from 'discord.js';
 
-// ✅ Try to read image_base from central config, but keep hard fallbacks
-let CONFIG_IMAGE_BASE = '';
-try {
-  // eslint-disable-next-line import/no-unresolved
-  const cfg = await import('../utils/config.js');
-  CONFIG_IMAGE_BASE = (cfg?.image_base || cfg?.IMAGE_BASE || '').trim();
-} catch (_) {
-  // no-op; will use envs/fallbacks below
-}
-
-const LINKED_DECKS_FILE = 'data/linked_decks.json';
-const TRADES_FILE       = 'data/trades.json';
-const TRADE_LIMITS_FILE = 'data/trade_limits.json';
+const LINKED_DECKS_FILE = PATHS.linkedDecks;
+const TRADES_FILE       = PATHS.trades;
+const TRADE_LIMITS_FILE = PATHS.tradeLimits;
 
 const cardListPath      = path.resolve('./logic/CoreMasterReference.json'); // static asset
 
-const MAX_PER_DAY = 3;
-const SESSION_TTL_HOURS = 24;
+const MAX_PER_DAY = config.trade.daily_initiation_limit;
+const SESSION_TTL_HOURS = config.trade.ttl_hours;
 
 // 🔧 NEW: Toggle whether the server also DMs the initiator on /trade/start
 const SEND_SERVER_TRADE_DM = String(process.env.SEND_SERVER_TRADE_DM || 'false').toLowerCase() === 'true';
 
-function todayStr() {
-  return new Date().toISOString().slice(0,10);
-}
+const todayStr = utcTradeDay;
 function randomId(len=24) {
   return crypto.randomBytes(Math.ceil((len*3)/4)).toString('base64url').slice(0, len);
 }
@@ -58,20 +49,11 @@ function randomId(len=24) {
 //    Handle both object and string just in case a backend ever returns text.
 async function readJsonRemote(name, fb) {
   try {
-    const raw = await load_file(name);
-    if (raw == null) return fb;
-    if (typeof raw === 'object') return raw;
-    if (typeof raw === 'string') {
-      try { return JSON.parse(raw); } catch { return fb; }
-    }
-    return fb;
+    const raw = await loadJSON(name);
+    return raw && typeof raw === 'object' ? raw : fb;
   } catch {
     return fb;
   }
-}
-async function writeJsonRemote(name, data) {
-  // ✅ save_file expects a JS value; do NOT JSON.stringify here.
-  await save_file(name, data);
 }
 
 // ---- Local read helper for static card master ----
@@ -83,50 +65,10 @@ async function readJsonLocal(file, fb) {
   }
 }
 
-function clampCards(cards) {
-  const set = new Set();
-  const out = [];
-  for (const c of (cards||[])) {
-    const id = pad3(c);
-    if (!set.has(id) && out.length < 3) {
-      set.add(id);
-      out.push(id);
-    }
-  }
-  return out;
-}
-function incLimit(limits, userId, day) {
-  limits[userId] ||= {};
-  limits[userId][day] = (limits[userId][day] || 0) + 1;
-}
-function getUsed(limits, userId, day) {
-  return limits?.[userId]?.[day] || 0;
-}
-function hasExpired(session) {
-  if (!session?.expiresAt) return false;
-  return Date.now() > new Date(session.expiresAt).getTime();
-}
-function dayOf(isoLike) {
-  try { return new Date(isoLike).toISOString().slice(0,10); } catch { return todayStr(); }
-}
-
-// Count how many sessions the user has *started today* by scanning TRADES_FILE.
-// We purposely do not count "expired" sessions; everything else (active/decision/accepted/denied) counts.
-function countInitiationsToday(tradesObj = {}, initiatorId, day = todayStr()) {
-  let n = 0;
-  for (const s of Object.values(tradesObj || {})) {
-    if (!s || s?.initiator?.userId !== initiatorId) continue;
-    const d = dayOf(s.createdAt);
-    if (d !== day) continue;
-    if (s.status === 'expired') continue;
-    n += 1;
-  }
-  return n;
-}
-
+function clampCards(cards) { return normalizeTradeSelection(cards, config.trade.max_cards_per_side); }
 // Build a Collection UI link following the UI/cog contract:
 // ?mode=trade&tradeSession=<id>&role=<initiator|partner>[&stage=...&partner=...]
-function buildUiLink({ base, token, apiBase, meBase, sessionId, role, stage, partnerName }) {
+function buildUiLink({ base, token, apiBase, sessionId, role, stage, partnerName }) {
   const ts = Date.now();
   const qp = new URLSearchParams();
   qp.set('mode', 'trade');
@@ -134,7 +76,6 @@ function buildUiLink({ base, token, apiBase, meBase, sessionId, role, stage, par
   if (role) qp.set('role', role);
   if (token) qp.set('token', token);
   if (apiBase) qp.set('api', apiBase);
-  if (meBase) qp.set('me', meBase);
   if (stage) qp.set('stage', stage);
   if (partnerName) qp.set('partner', partnerName);
   qp.set('ts', String(ts));
@@ -185,13 +126,7 @@ function collectionToArray(collection = {}, idx = {}) {
 // ✅ Image base + fallback resolver
 function getImageBase() {
   const env = (process.env.IMAGE_BASE || process.env.image_base || '').trim();
-  const cfg = CONFIG_IMAGE_BASE;
-  // Prefer configured base; then env; then stable fallbacks
-  return (
-    cfg ||
-    env ||
-    'https://madv313.github.io/Card-Collection-UI/images/cards'
-  );
+  return env || config.image_base || 'https://sv13tcg.com/assets/cards';
 }
 function cardImageUrl(filename) {
   const base = getImageBase().replace(/\/+$/, '');
@@ -275,7 +210,6 @@ export default function createTradeRouter(bot) {
         initiatorId: initiatorIdRaw,
         partnerId: partnerIdRaw,
         apiBase,
-        meBase,              // ✅ NEW: allow caller to pass ME base
         collectionUiBase
       } = req.body || {};
 
@@ -299,9 +233,8 @@ export default function createTradeRouter(bot) {
         return res.status(400).json({ error: 'Cannot trade with yourself.' });
       }
 
-      const [linked, limits, tradesBefore] = await Promise.all([
+      const [linked, tradesBefore] = await Promise.all([
         readJsonRemote(LINKED_DECKS_FILE, {}),
-        readJsonRemote(TRADE_LIMITS_FILE, {}),
         readJsonRemote(TRADES_FILE, {})
       ]);
 
@@ -340,11 +273,8 @@ export default function createTradeRouter(bot) {
 
       // Enforce 3/day (initiations) — compute from TRADES file (authoritative for "starts today")
       const day = todayStr();
-      const usedFromFile = getUsed(limits, initiatorId, day);
-      const usedFromTrades = countInitiationsToday(tradesBefore, initiatorId, day);
-      const used = Math.max(usedFromTrades, Math.min(usedFromFile, usedFromTrades)); // favor real count
-      // Debug to help catch mismatches
-      console.log('[trade/start] limit check', { day, initiatorId, usedFromFile, usedFromTrades, used, MAX_PER_DAY });
+      const used = countTradeInitiationsToday(tradesBefore, initiatorId, day);
+      console.log('[trade/start] limit check', { day, initiatorId, used, MAX_PER_DAY });
 
       if (used >= MAX_PER_DAY) {
         return res.status(429).json({ error: `Trade limit reached (${MAX_PER_DAY}/day).` });
@@ -371,33 +301,38 @@ export default function createTradeRouter(bot) {
           selection: [],            // up to 3 (ids)
         },
         // ✅ store bases for consistent deep-links
-        apiBase: apiBase || process.env.API_BASE || process.env.api_base || '',
-        meBase:  meBase  || process.env.ME_BASE || process.env.me_base  || '',
+        apiBase: apiBase || (config.pass_api_query ? config.api_base : ''),
       };
 
-      // Persist session
-      const trades = { ...(tradesBefore || {}) };
-      trades[sessionId] = session;
-      await writeJsonRemote(TRADES_FILE, trades);
+      // Persist with Repo #1 CAS so simultaneous starts cannot bypass the daily limit
+      // or overwrite unrelated trade sessions.
+      let usedAfter = 0;
+      await updateJSONAtomic(TRADES_FILE, current => {
+        const usedNow = countTradeInitiationsToday(current, initiatorId, day);
+        if (usedNow >= MAX_PER_DAY) throw Object.assign(new Error(`Trade limit reached (${MAX_PER_DAY}/day).`), { status: 429 });
+        current[sessionId] = session;
+        usedAfter = usedNow + 1;
+        return current;
+      }, { defaultValue: {} });
 
-      // Mirror today's count into TRADE_LIMITS_FILE (optional; keeps legacy endpoint happy)
-      // We DO NOT rely on this to enforce limits anymore — source of truth is TRADES_FILE scan.
-      const limitsCopy = { ...(limits || {}) };
-      limitsCopy[initiatorId] ||= {};
-      limitsCopy[initiatorId][day] = countInitiationsToday(trades, initiatorId, day);
-      await writeJsonRemote(TRADE_LIMITS_FILE, limitsCopy);
+      // Mirror the canonical count for older consumers. This ledger is not used to
+      // authorize a trade start; the CAS-protected session scan above is authoritative.
+      await updateJSONAtomic(TRADE_LIMITS_FILE, current => {
+        current[initiatorId] ||= {};
+        current[initiatorId][day] = usedAfter;
+        return current;
+      }, { defaultValue: {} });
 
       // Build link for initiator (role=initiator)
       const uiBase = (collectionUiBase ||
         process.env.COLLECTION_UI_BASE ||
         process.env.COLLECTION_UI ||
-        'https://madv313.github.io/Card-Collection-UI');
+        UI.collection);
 
       const initLink = buildUiLink({
         base: uiBase,
         token: iniToken,
         apiBase: session.apiBase,   // ✅ use stored
-        meBase:  session.meBase,    // ✅ include me=
         sessionId,
         role: 'initiator',
         stage: 'pickMine',
@@ -425,7 +360,7 @@ export default function createTradeRouter(bot) {
       });
     } catch (e) {
       console.error('[trade/start] error:', e);
-      return res.status(500).json({ error: 'Internal error' });
+      return res.status(e?.status || 500).json({ error: e?.message || 'Internal error' });
     }
   });
 
@@ -433,38 +368,27 @@ export default function createTradeRouter(bot) {
   router.get('/trade/:session/state', async (req, res) => {
     try {
       const { session } = req.params;
+      const token = String(req.query?.token || req.get('X-Player-Token') || '');
+      if (!token) return res.status(401).json({ error: 'Player token required' });
+      const userId = await resolveUserIdByToken(token);
+      if (!userId) return res.status(401).json({ error: 'Invalid player token' });
       const trades = await readJsonRemote(TRADES_FILE, {});
       const s = trades[session];
       if (!s) return res.status(404).json({ error: 'Session not found' });
-
+      const role = String(userId) === String(s.initiator.userId) ? 'initiator' : String(userId) === String(s.partner.userId) ? 'partner' : null;
+      if (!role) return res.status(403).json({ error: 'Not a participant in this trade' });
       if (hasExpired(s) && s.status === 'active') {
         s.status = 'expired';
-        trades[session] = s;
-        await writeJsonRemote(TRADES_FILE, trades);
+        await updateJSONAtomic(TRADES_FILE, current => { if (current?.[session]?.status === 'active' && hasExpired(current[session])) current[session].status = 'expired'; return current; }, { defaultValue: {} });
       }
-
-      // Return safe view
-      const payload = {
-        ok: true,
-        id: s.id,
-        status: s.status,
-        stage: s.stage,
-        expiresAt: s.expiresAt,
-        initiator: {
-          name: s.initiator.name,
-          userId: s.initiator.userId,
-          selection: s.initiator.selection,
-        },
-        partner: {
-          name: s.partner.name,
-          userId: s.partner.userId,
-          selection: s.partner.selection,
-        }
-      };
-      return res.json(payload);
+      return res.json({
+        ok: true, id: s.id, status: s.status, stage: s.stage, expiresAt: s.expiresAt, role,
+        initiator: { name: s.initiator.name, selection: s.initiator.selection },
+        partner: { name: s.partner.name, selection: s.partner.selection }
+      });
     } catch (e) {
       console.error('[trade/state] error:', e);
-      return res.status(500).json({ error: 'Internal error' });
+      return res.status(e?.status || 500).json({ error: e?.message || 'Internal error' });
     }
   });
 
@@ -480,10 +404,12 @@ export default function createTradeRouter(bot) {
       const s = trades[session];
       if (!s) return res.status(404).json({ error: 'Session not found' });
 
-      // Identify which side is requesting
+      // Resolve the current canonical player token to a participant. Do not treat
+      // role= or a stale token copied into the trade record as authorization.
+      const viewerId = await resolveUserIdByToken(String(token));
       let role = null;
-      if (token === s.initiator.token) role = 'initiator';
-      else if (token === s.partner.token) role = 'partner';
+      if (String(viewerId) === String(s.initiator.userId)) role = 'initiator';
+      else if (String(viewerId) === String(s.partner.userId)) role = 'partner';
       else return res.status(403).json({ error: 'Invalid session token' });
 
       // Load profiles and card metadata
@@ -523,7 +449,8 @@ export default function createTradeRouter(bot) {
       const s = trades[session];
       if (!s) return res.status(404).json({ error: 'Session not found' });
 
-      if (![s.initiator.token, s.partner.token].includes(token)) {
+      const viewerId = await resolveUserIdByToken(String(token));
+      if (![String(s.initiator.userId), String(s.partner.userId)].includes(String(viewerId || ''))) {
         return res.status(403).json({ error: 'Invalid session token' });
       }
 
@@ -560,118 +487,70 @@ export default function createTradeRouter(bot) {
     try {
       const { session } = req.params;
       const { token, cards } = req.body || {};
-      if (!token || !Array.isArray(cards)) {
-        return res.status(400).json({ error: 'Missing token or cards' });
-      }
-  
-      const trades = await readJsonRemote(TRADES_FILE, {});
-      const s = trades[session];
-      if (!s) return res.status(404).json({ error: 'Session not found' });
-      if (hasExpired(s) || s.status !== 'active') {
-        s.status = 'expired';
-        trades[session] = s;
-        await writeJsonRemote(TRADES_FILE, trades);
-        return res.status(410).json({ error: 'Session expired' });
-      }
-  
-      const idFromToken = await resolveUserIdByToken(token);
+      if (!token || !Array.isArray(cards)) return res.status(400).json({ error: 'Missing token or cards' });
+      const idFromToken = await resolveUserIdByToken(String(token));
       if (!idFromToken) return res.status(403).json({ error: 'Invalid token' });
-  
       const sel = clampCards(cards);
-  
-      // Initiator selects their cards
-      if (s.stage === 'pickMine') {
-        if (idFromToken !== s.initiator.userId) {
-          return res.status(403).json({ error: 'Not initiator turn' });
+
+      let after = null;
+      await updateJSONAtomic(TRADES_FILE, trades => {
+        const trade = trades?.[session];
+        if (!trade) throw Object.assign(new Error('Session not found'), { status: 404 });
+        if (hasExpired(trade) || trade.status !== 'active') {
+          if (trade.status === 'active') trade.status = 'expired';
+          throw Object.assign(new Error('Session expired'), { status: 410 });
         }
-        s.initiator.selection = sel;
-        s.stage = 'pickTheirs';
-        trades[session] = s;
-        await writeJsonRemote(TRADES_FILE, trades);
-  
-        // DM partner to review & pick
-        try {
-          const uiBase = (process.env.COLLECTION_UI_BASE ||
-            process.env.COLLECTION_UI ||
-            'https://madv313.github.io/Card-Collection-UI');
-          const apiBase = s.apiBase || process.env.API_BASE || process.env.api_base || '';
-          const meBase  = s.meBase  || process.env.ME_BASE || process.env.me_base  || '';
-          const partnerLink = buildUiLink({
-            base: uiBase,
-            token: s.partner.token,
-            apiBase,
-            meBase,
-            sessionId: s.id,
-            role: 'partner',
-            stage: 'pickTheirs',
-            partnerName: s.initiator.name
-          });
-          const partnerUser = await bot.users.fetch(s.partner.userId);
-          await partnerUser.send({
-            content: `📨 **Trade offer from <@${s.initiator.userId}>**\nSelect up to 3 cards you want to trade in return: ${partnerLink}`
-          });
-        } catch (e) {
-          console.warn('[trade/select] Failed to DM partner:', e?.message || e);
+        if (idFromToken !== trade.initiator.userId) throw Object.assign(new Error('Not initiator turn'), { status: 403 });
+        if (trade.stage === 'pickMine') {
+          trade.initiator.selection = sel;
+          trade.stage = 'pickTheirs';
+        } else if (trade.stage === 'pickTheirs') {
+          trade.partner.selection = sel;
+          trade.stage = 'decision';
+        } else {
+          throw Object.assign(new Error(`Cannot select cards during stage "${trade.stage}"`), { status: 400 });
         }
-  
-        return res.json({
-          ok: true,
-          stage: s.stage,
-          initiator: { selection: s.initiator.selection },
-          partner: { selection: s.partner.selection },
-          message: 'Your selection is saved. Waiting for partner.'
+        trade.updatedAt = new Date().toISOString();
+        trade.revision = Number(trade.revision || 0) + 1;
+        after = structuredClone(trade);
+        trades[session] = trade;
+        return trades;
+      }, { defaultValue: {} });
+
+      // Preserve the original partner notification flow. role= is display context only;
+      // authorization remains token/session based on every API call.
+      try {
+        const uiBase = process.env.COLLECTION_UI_BASE || process.env.COLLECTION_UI || UI.collection;
+        const partnerLink = buildUiLink({
+          base: uiBase,
+          token: after.partner.token,
+          apiBase: after.apiBase || '',
+          sessionId: after.id,
+          role: 'partner',
+          stage: after.stage,
+          partnerName: after.initiator.name
         });
+        const partnerUser = await bot.users.fetch(after.partner.userId);
+        const content = after.stage === 'decision'
+          ? `📨 **Trade proposal from <@${after.initiator.userId}>**\nReview and decide: ${partnerLink}`
+          : `📨 **Trade offer from <@${after.initiator.userId}>**\nSelect up to 3 cards you want to trade in return: ${partnerLink}`;
+        await partnerUser.send({ content });
+      } catch (e) {
+        console.warn('[trade/select] Failed to DM partner:', e?.message || e);
       }
-  
-      // Initiator selects FROM partner’s collection
-      if (s.stage === 'pickTheirs') {
-        if (idFromToken !== s.initiator.userId) {
-          return res.status(403).json({ error: 'Not initiator turn' });
-        }
-        s.partner.selection = sel;           // initiator picks FROM partner’s collection
-        s.stage = 'decision';                // next: partner reviews & accepts/denies
-        trades[session] = s;
-        await writeJsonRemote(TRADES_FILE, trades);
-  
-        // (Optional) DM partner a link that opens straight to decision stage
-        try {
-          const uiBase = (process.env.COLLECTION_UI_BASE ||
-            process.env.COLLECTION_UI ||
-            'https://madv313.github.io/Card-Collection-UI');
-          const apiBase = s.apiBase || process.env.API_BASE || process.env.api_base || '';
-          const meBase  = s.meBase  || process.env.ME_BASE || process.env.me_base  || '';
-          const partnerLink = buildUiLink({
-            base: uiBase,
-            token: s.partner.token,
-            apiBase,
-            meBase,
-            sessionId: s.id,
-            role: 'partner',
-            stage: 'decision',
-            partnerName: s.initiator.name
-          });
-          const partnerUser = await bot.users.fetch(s.partner.userId);
-          await partnerUser.send({
-            content: `📨 **Trade proposal from <@${s.initiator.userId}>**\nReview and decide: ${partnerLink}`
-          });
-        } catch (e) {
-          console.warn('[trade/select] Failed to DM partner (decision):', e?.message || e);
-        }
-  
-        return res.json({
-          ok: true,
-          stage: s.stage,
-          initiator: { selection: s.initiator.selection },
-          partner:   { selection: s.partner.selection },
-          message: 'Your request is saved. Waiting for partner decision.'
-        });
-      }
-  
-      // Any other stage is invalid for /select
-      return res.status(400).json({ error: `Cannot select cards during stage "${s.stage}"` });
+
+      return res.json({
+        ok: true,
+        stage: after.stage,
+        initiator: { selection: after.initiator.selection },
+        partner: { selection: after.partner.selection },
+        message: after.stage === 'decision'
+          ? 'Your request is saved. Waiting for partner decision.'
+          : 'Your selection is saved. Waiting for partner.'
+      });
     } catch (e) {
       console.error('[trade/select] error:', e);
-      return res.status(500).json({ error: 'Internal error' });
+      return res.status(e?.status || 500).json({ error: e?.message || 'Internal error' });
     }
   });
 
@@ -683,176 +562,89 @@ export default function createTradeRouter(bot) {
       const { token } = req.body || {};
       let { decision } = req.body || {};
       const hasAcceptBool = Object.prototype.hasOwnProperty.call(req.body || {}, 'accept');
+      if (!token || (typeof decision === 'undefined' && !hasAcceptBool)) return res.status(400).json({ error: 'Missing token or decision' });
+      if (hasAcceptBool) decision = req.body.accept ? 'accept' : 'deny';
+      decision = String(decision || '').toLowerCase();
+      if (!['accept','deny'].includes(decision)) return res.status(400).json({ error: 'Invalid decision' });
 
-      if (!token || (typeof decision === 'undefined' && !hasAcceptBool)) {
-        return res.status(400).json({ error: 'Missing token or decision' });
-      }
+      const userId = await resolveUserIdByToken(String(token));
+      if (!userId) return res.status(403).json({ error: 'Invalid player token' });
 
-      if (hasAcceptBool) {
-        decision = req.body.accept ? 'accept' : 'deny';
-      }
-
-      if (!['accept','deny'].includes(String(decision))) {
-        return res.status(400).json({ error: 'Invalid decision' });
-      }
-
-      const trades = await readJsonRemote(TRADES_FILE, {});
-      const s = trades[session];
-      if (!s) return res.status(404).json({ error: 'Session not found' });
-      if (hasExpired(s) || s.status !== 'active') {
-        s.status = 'expired';
-        trades[session] = s;
-        await writeJsonRemote(TRADES_FILE, trades);
-        return res.status(410).json({ error: 'Session expired' });
-      }
-
-      const userId = await resolveUserIdByToken(token);
-      if (!userId || userId !== s.partner.userId) {
-        return res.status(403).json({ error: 'Only partner can decide' });
-      }
-      if (s.stage !== 'decision') {
-        return res.status(400).json({ error: 'Not in decision stage' });
-      }
-
-      // Load card index once (for thumbnails)
-      const idx = await loadCardIndex();
-
-      // Helper to build up to 3 card embeds with thumbnails (with past-tense titles)
-      function buildCardEmbeds(ids = [], titlePrefix = '') {
-        const embeds = [];
-        for (const id of ids) {
-          const m = metaFor(id, idx);
-          const img = m.filename ? cardImageUrl(m.filename) : cardBackUrl();
-          const emb = new EmbedBuilder()
-            .setTitle(`${titlePrefix} #${id} — ${m.name}`)
-            .setThumbnail(img)
-            .setColor(0x00ccff)
-            .setFooter({ text: `${m.rarity}${m.type ? ` • ${m.type}` : ''}` });
-          embeds.push(emb);
-        }
-        return embeds;
-      }
-
+      let snapshot = null;
       if (decision === 'deny') {
-        s.status = 'denied';
-        trades[session] = s;
-        await writeJsonRemote(TRADES_FILE, trades);
+        await updateJSONAtomic(TRADES_FILE, trades => {
+          const trade = trades?.[session];
+          if (!trade) throw Object.assign(new Error('Session not found'), { status: 404 });
+          if (hasExpired(trade)) { trade.status = 'expired'; throw Object.assign(new Error('Session expired'), { status: 410 }); }
+          if (String(userId) !== String(trade.partner.userId)) throw Object.assign(new Error('Only partner can decide'), { status: 403 });
+          if (trade.status !== 'active' || trade.stage !== 'decision') throw Object.assign(new Error('Trade is not awaiting a decision'), { status: 409 });
+          trade.status = 'denied'; trade.stage = 'done'; trade.updatedAt = new Date().toISOString(); trade.revision = Number(trade.revision || 0) + 1;
+          snapshot = structuredClone(trade); trades[session] = trade; return trades;
+        }, { defaultValue: {} });
 
-        // Build concise headers (mention in description so it renders)
-        const headerIniDeny = new EmbedBuilder()
-          .setTitle('❌ Trade denied.')
-          .setDescription(`With <@${s.partner.userId}>. No cards were exchanged.`)
-          .setColor(0xff3b30);
-
-        const headerParDeny = new EmbedBuilder()
-          .setTitle('❌ Trade denied.')
-          .setDescription(`With <@${s.initiator.userId}>. No cards were exchanged.`)
-          .setColor(0xff3b30);
-
-        // DM both sides
-        try {
-          const u = await bot.users.fetch(s.initiator.userId);
-          await u.send({ embeds: [headerIniDeny] });
-        } catch {}
-        try {
-          const p = await bot.users.fetch(s.partner.userId);
-          await p.send({ embeds: [headerParDeny] });
-        } catch {}
-
-        return res.json({ ok: true, status: s.status, message: 'Trade denied.' });
+        const headerIniDeny = new EmbedBuilder().setTitle('❌ Trade denied.').setDescription(`With <@${snapshot.partner.userId}>. No cards were exchanged.`).setColor(0xff3b30);
+        const headerParDeny = new EmbedBuilder().setTitle('❌ Trade denied.').setDescription(`With <@${snapshot.initiator.userId}>. No cards were exchanged.`).setColor(0xff3b30);
+        try { const u = await bot.users.fetch(snapshot.initiator.userId); await u.send({ embeds: [headerIniDeny] }); } catch {}
+        try { const u = await bot.users.fetch(snapshot.partner.userId); await u.send({ embeds: [headerParDeny] }); } catch {}
+        return res.json({ ok: true, status: 'denied', message: 'Trade denied.' });
       }
 
-      // ACCEPT: validate ownership, then swap
-      const linked = await readJsonRemote(LINKED_DECKS_FILE, {});
-      const A = linked[s.initiator.userId];
-      const B = linked[s.partner.userId];
-      if (!A?.collection || !B?.collection) {
-        return res.status(400).json({ error: 'Profiles unavailable.' });
-      }
-      const colA = { ...A.collection };
-      const colB = { ...B.collection };
+      // Claim this decision before touching player collections. The applying state prevents
+      // double application from duplicate clicks or concurrent requests.
+      await updateJSONAtomic(TRADES_FILE, trades => {
+        const trade = trades?.[session];
+        if (!trade) throw Object.assign(new Error('Session not found'), { status: 404 });
+        if (hasExpired(trade)) { trade.status = 'expired'; throw Object.assign(new Error('Session expired'), { status: 410 }); }
+        if (String(userId) !== String(trade.partner.userId)) throw Object.assign(new Error('Only partner can decide'), { status: 403 });
+        if (trade.status === 'applying') throw Object.assign(new Error('Trade application is already in progress'), { status: 409 });
+        if (trade.status === 'accepted') { snapshot = structuredClone(trade); return trades; }
+        if (trade.status !== 'active' || trade.stage !== 'decision') throw Object.assign(new Error('Trade is not awaiting a decision'), { status: 409 });
+        trade.status = 'applying'; trade.applyingAt = new Date().toISOString(); trade.updatedAt = trade.applyingAt; trade.revision = Number(trade.revision || 0) + 1;
+        snapshot = structuredClone(trade); trades[session] = trade; return trades;
+      }, { defaultValue: {} });
 
-      const giveA = s.initiator.selection; // A → B
-      const giveB = s.partner.selection;   // B → A
+      if (snapshot.status === 'accepted') return res.json({ ok: true, status: 'accepted', message: 'Trade already accepted and applied.' });
 
-      // Validate A owns giveA
-      for (const id of giveA) {
-        if ((colA[id] || 0) <= 0) {
-          return res.status(409).json({ error: `Initiator no longer owns #${id}` });
-        }
-      }
-      // Validate B owns giveB
-      for (const id of giveB) {
-        if ((colB[id] || 0) <= 0) {
-          return res.status(409).json({ error: `Partner no longer owns #${id}` });
-        }
-      }
-
-      // Perform swap (1 copy per selection)
-      for (const id of giveA) {
-        colA[id] = (colA[id] || 0) - 1;
-        if (colA[id] <= 0) delete colA[id];
-        colB[id] = (colB[id] || 0) + 1;
-      }
-      for (const id of giveB) {
-        colB[id] = (colB[id] || 0) - 1;
-        if (colB[id] <= 0) delete colB[id];
-        colA[id] = (colA[id] || 0) + 1;
-      }
-
-      A.collection = colA;
-      B.collection = colB;
-
-      await writeJsonRemote(LINKED_DECKS_FILE, linked);
-
-      s.status = 'accepted';
-      trades[session] = s;
-      await writeJsonRemote(TRADES_FILE, trades);
-
-      // ✅ Build rich DM receipts with thumbnails for BOTH players
-      // Header embeds: mentions in description so they render
-      const headerIni = new EmbedBuilder()
-        .setTitle('✅ Trade accepted.')
-        .setDescription(`With <@${s.partner.userId}>. Cards have been swapped.`)
-        .setColor(0x34c759);
-
-      const headerPar = new EmbedBuilder()
-        .setTitle('✅ Trade accepted.')
-        .setDescription(`With <@${s.initiator.userId}>. Cards have been swapped.`)
-        .setColor(0x34c759);
-
-      // Thumbnail card embeds (cap at 3 per side) — titles in past tense
-      // Initiator's perspective
-      const iniCardThumbs = [
-        ...buildCardEmbeds(giveB.slice(0, 3), 'Received'),
-        ...buildCardEmbeds(giveA.slice(0, 3), 'Gave')
-      ];
-      // Partner's perspective
-      const parCardThumbs = [
-        ...buildCardEmbeds(giveA.slice(0, 3), 'Received'),
-        ...buildCardEmbeds(giveB.slice(0, 3), 'Gave')
-      ];
-
-      // Send to initiator
+      const giveA = clampCards(snapshot.initiator.selection);
+      const giveB = clampCards(snapshot.partner.selection);
       try {
-        const ini = await bot.users.fetch(s.initiator.userId);
-        await ini.send({ embeds: [headerIni, ...iniCardThumbs] });
-      } catch {}
+        await updateJSONAtomic(LINKED_DECKS_FILE, linked =>
+          applyCardExchange(linked, snapshot, { maxCards: config.trade.max_cards_per_side }).linked,
+        { defaultValue: {} });
+      } catch (e) {
+        await updateJSONAtomic(TRADES_FILE, trades => {
+          const trade = trades?.[session];
+          if (trade?.status === 'applying') { trade.status = 'active'; trade.stage = 'decision'; trade.applyError = String(e?.message || e).slice(0, 200); trade.updatedAt = new Date().toISOString(); trade.revision = Number(trade.revision || 0) + 1; }
+          return trades;
+        }, { defaultValue: {} }).catch(() => {});
+        throw e;
+      }
 
-      // Send to partner
-      try {
-        const par = await bot.users.fetch(s.partner.userId);
-        await par.send({ embeds: [headerPar, ...parCardThumbs] });
-      } catch {}
+      await updateJSONAtomic(TRADES_FILE, trades => {
+        const trade = trades?.[session];
+        if (!trade) throw Object.assign(new Error('Session disappeared after exchange'), { status: 500 });
+        if (trade.status !== 'applying') throw Object.assign(new Error(`Unexpected trade status ${trade.status}`), { status: 409 });
+        trade.status = 'accepted'; trade.stage = 'done'; trade.acceptedAt = new Date().toISOString(); trade.updatedAt = trade.acceptedAt; trade.revision = Number(trade.revision || 0) + 1; delete trade.applyError;
+        snapshot = structuredClone(trade); trades[session] = trade; return trades;
+      }, { defaultValue: {} });
 
-      return res.json({
-        ok: true,
-        status: s.status,
-        message: 'Trade accepted and applied.'
-      });
+      const idx = await loadCardIndex();
+      function buildCardEmbeds(ids = [], titlePrefix = '') {
+        return ids.slice(0,3).map(id => {
+          const m = metaFor(id, idx); const img = m.filename ? cardImageUrl(m.filename) : cardBackUrl();
+          return new EmbedBuilder().setTitle(`${titlePrefix} #${id} — ${m.name}`).setThumbnail(img).setColor(0x00ccff).setFooter({ text: `${m.rarity}${m.type ? ` • ${m.type}` : ''}` });
+        });
+      }
+      const headerIni = new EmbedBuilder().setTitle('✅ Trade accepted.').setDescription(`With <@${snapshot.partner.userId}>. Cards have been swapped.`).setColor(0x34c759);
+      const headerPar = new EmbedBuilder().setTitle('✅ Trade accepted.').setDescription(`With <@${snapshot.initiator.userId}>. Cards have been swapped.`).setColor(0x34c759);
+      const iniCardThumbs = [...buildCardEmbeds(giveB,'Received'), ...buildCardEmbeds(giveA,'Gave')];
+      const parCardThumbs = [...buildCardEmbeds(giveA,'Received'), ...buildCardEmbeds(giveB,'Gave')];
+      try { const u = await bot.users.fetch(snapshot.initiator.userId); await u.send({ embeds: [headerIni, ...iniCardThumbs] }); } catch {}
+      try { const u = await bot.users.fetch(snapshot.partner.userId); await u.send({ embeds: [headerPar, ...parCardThumbs] }); } catch {}
+      return res.json({ ok: true, status: 'accepted', message: 'Trade accepted and applied.' });
     } catch (e) {
       console.error('[trade/decision] error:', e);
-      return res.status(500).json({ error: 'Internal error' });
+      return res.status(e?.status || 500).json({ error: e?.message || 'Internal error' });
     }
   });
 
@@ -863,27 +655,8 @@ export default function createTradeRouter(bot) {
       const userId = await resolveUserIdByToken(String(token||''));
       if (!userId) return res.status(404).json({ error: 'Invalid token' });
 
-      const [limits, trades] = await Promise.all([
-        readJsonRemote(TRADE_LIMITS_FILE, {}),
-        readJsonRemote(TRADES_FILE, {})
-      ]);
-
-      const day = todayStr();
-      const usedFromFile = getUsed(limits, userId, day);
-      const usedFromTrades = countInitiationsToday(trades, userId, day);
-      // Source of truth is the scan; expose that number
-      const used = usedFromTrades;
-
-      // Keep legacy file in sync for transparency (optional)
-      if ((limits?.[userId]?.[day] || 0) !== used) {
-        const copy = { ...(limits || {}) };
-        copy[userId] ||= {};
-        copy[userId][day] = used;
-        await writeJsonRemote(TRADE_LIMITS_FILE, copy);
-      }
-
-      const remaining = Math.max(0, MAX_PER_DAY - used);
-      return res.json({ ok: true, userId, day, usedToday: used, remaining, maxPerDay: MAX_PER_DAY });
+      const status = await getTradeLimitStatus(userId);
+      return res.json({ ok: true, ...status });
     } catch (e) {
       console.error('[trade/limits] error:', e);
       return res.status(500).json({ error: 'Internal error' });
