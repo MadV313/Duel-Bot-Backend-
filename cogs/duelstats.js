@@ -5,13 +5,13 @@
 // - Ensures the user has a token (mints + persists if missing)
 
 import fs from 'fs';
-import crypto from 'crypto';
 import {
   SlashCommandBuilder,
   EmbedBuilder,
 } from 'discord.js';
 
-import { loadJSON, saveJSON, PATHS } from '../utils/storageClient.js';
+import { loadJSON, PATHS } from '../utils/storageClient.js';
+import { ensureLinkedToken } from '../utils/playerLinks.js';
 
 /* ───────────────────────────── Config helpers ───────────────────────────── */
 function readOptionalConfig() {
@@ -44,7 +44,7 @@ function resolveLeaderboardBase(cfg = {}) {
     cfg.frontend_url,
     cfg.ui_base,
     // ✅ Correct fallback that exists:
-    'https://madv313.github.io/Leaderboard-UI'
+    'https://leaderboard.sv13tcg.com'
   );
 }
 
@@ -57,7 +57,8 @@ function resolveApiBase(cfg = {}) {
 
 const LEADERBOARD_BASE = resolveLeaderboardBase(CFG);
 const API_BASE = resolveApiBase(CFG);
-const apiQP = API_BASE ? `&api=${encodeURIComponent(API_BASE)}` : '';
+const PASS_API_QUERY = String(process.env.PASS_API_QUERY ?? CFG.pass_api_query ?? 'false').toLowerCase() === 'true';
+const apiQP = PASS_API_QUERY && API_BASE ? `&api=${encodeURIComponent(API_BASE)}` : '';
 
 if (!LEADERBOARD_BASE) {
   console.warn('[duelstats] No LEADERBOARD_BASE resolved — set STATS_LEADERBOARD_UI or config.stats_leaderboard_ui.');
@@ -77,13 +78,6 @@ const BATTLEFIELD_CHANNEL_ID = String(
 );
 
 /* ───────────────────────────── Small utils ───────────────────────────── */
-function randomToken(len = 24) {
-  return crypto.randomBytes(Math.ceil((len * 3) / 4)).toString('base64url').slice(0, len);
-}
-function isTokenValid(t) {
-  return typeof t === 'string' && /^[A-Za-z0-9_-]{12,128}$/.test(t);
-}
-
 /* ───────────────────────────── Command ───────────────────────────── */
 export default async function registerDuelStats(client) {
   const data = new SlashCommandBuilder()
@@ -108,8 +102,8 @@ export default async function registerDuelStats(client) {
         return interaction.reply({
           content:
             '⚠️ Leaderboard UI base URL is not configured.\n' +
-            'Set **STATS_LEADERBOARD_UI** (or `stats_leaderboard_ui` in config.json) to your GitHub Pages root, e.g.:\n' +
-            '`https://madv313.github.io/Leaderboard-UI`',
+            'Set **LEADERBOARD_UI** (or `leaderboard_ui` in config.json) to your leaderboard root, e.g.:\n' +
+            '`https://leaderboard.sv13tcg.com`',
           ephemeral: true,
         });
       }
@@ -139,21 +133,14 @@ export default async function registerDuelStats(client) {
         });
       }
 
-      // Refresh display name; ensure token exists
-      profile.discordName = username;
-      if (!isTokenValid(profile.token)) {
-        profile.token = randomToken(24);
-        try {
-          linked[userId] = profile;
-          await saveJSON(PATHS.linkedDecks, linked);
-        } catch (e) {
-          console.warn('[duelstats] Failed to persist token mint:', e?.message || e);
-        }
+      let token;
+      try { token = await ensureLinkedToken(userId, username); }
+      catch (error) {
+        console.warn('[duelstats] Failed to refresh player identity:', error?.message || error);
+        return interaction.reply({ content: '⚠️ Could not refresh your profile. Please try again.', ephemeral: true });
       }
-
-      const token = profile.token;
       const ts = Date.now();
-      // Use repo root. index.html isn’t needed with GitHub Pages.
+      // Leaderboard is global; viewer token is carried only for optional personalization/navigation.
       const url = `${LEADERBOARD_BASE}/?token=${encodeURIComponent(token)}${apiQP}&ts=${ts}`;
 
       const embed = new EmbedBuilder()

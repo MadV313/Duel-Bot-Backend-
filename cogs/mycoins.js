@@ -6,14 +6,12 @@
 // - Uses unified coin bank (data/coin_bank.json) as source of truth, mirrors to linked_decks
 
 import fs from 'fs';
-import crypto from 'crypto';
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
-import { loadJSON, saveJSON, PATHS } from '../utils/storageClient.js';
+import { loadJSON, updateJSONAtomic, PATHS } from '../utils/storageClient.js';
+import { ensureLinkedToken } from '../utils/playerLinks.js';
 
 // -------- helpers --------
 const trimBase = (u = '') => String(u).trim().replace(/\/+$/, '');
-const randomToken = (len = 24) =>
-  crypto.randomBytes(Math.ceil((len * 3) / 4)).toString('base64url').slice(0, len);
 
 function loadConfig() {
   try {
@@ -33,13 +31,14 @@ function buildCollectionUrl(cfg, token) {
   const base =
     cfg.collection_ui ||
     cfg.ui_urls?.card_collection_ui ||
-    'https://madv313.github.io/Card-Collection-UI';
+    'https://collection.sv13tcg.com';
   const API_BASE = trimBase(cfg.api_base || cfg.API_BASE || process.env.API_BASE || '');
   const ts = Date.now();
 
   const qp = new URLSearchParams();
   qp.set('token', token);
-  if (API_BASE) qp.set('api', API_BASE);
+  const passApi = String(process.env.PASS_API_QUERY ?? cfg.pass_api_query ?? 'false').toLowerCase() === 'true';
+  if (passApi && API_BASE) qp.set('api', API_BASE);
   qp.set('ts', String(ts));
 
   return `${trimBase(base)}/index.html?${qp.toString()}`;
@@ -82,29 +81,25 @@ export default async function registerMyCoin(client) {
         });
       }
 
-      // Keep display name fresh
-      if (profile.discordName !== userName) {
-        profile.discordName = userName;
+      let token;
+      try { token = await ensureLinkedToken(userId, userName); }
+      catch (error) {
+        return interaction.reply({ content: '⚠️ Could not refresh your player profile. Please try again.', ephemeral: true });
       }
 
-      // Ensure token
-      if (typeof profile.token !== 'string' || profile.token.length < 12) {
-        profile.token = randomToken(24);
-        try { await saveJSON(PATHS.linkedDecks, { ...linked, [userId]: profile }); }
-        catch (e) { console.warn('[mycoin] failed to persist token mint:', e?.message || e); }
-      }
-
-      // Use bank as source of truth, fallback to profile.coins if absent
+      // coin_bank is authoritative; the profile mirror exists for legacy UI compatibility only.
       const coins = Number(bank[userId] ?? profile.coins ?? 0) || 0;
-
-      // Mirror back into linked profile for consistency with UIs that read linked_decks
-      if (profile.coins !== coins) {
-        profile.coins = coins;
-        profile.coinsUpdatedAt = new Date().toISOString();
-        try { await saveJSON(PATHS.linkedDecks, { ...linked, [userId]: profile }); } catch {}
+      if (Number(profile.coins ?? 0) !== coins) {
+        await updateJSONAtomic(PATHS.linkedDecks, current => {
+          if (current?.[userId]) {
+            current[userId].coins = coins;
+            current[userId].coinsUpdatedAt = new Date().toISOString();
+          }
+          return current;
+        }, { defaultValue: {} }).catch(() => {});
       }
 
-      const collectionUrl = buildCollectionUrl(CFG, profile.token);
+      const collectionUrl = buildCollectionUrl(CFG, token);
 
       const embed = new EmbedBuilder()
         .setTitle('🪙 Your Coin Balance')

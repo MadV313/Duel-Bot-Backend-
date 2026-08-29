@@ -10,14 +10,10 @@
 // - Enforces a daily sell limit (default 5 cards/day)
 // - Includes a “View Collection” link with instructions
 //
-// NEW: If API_BASE + token are available, we fetch live sell status from
-//      `${API_BASE}/me/:token/sell/status` so the embed reflects the current
-//      usage/limit (e.g., after selling from the Collection UI), and we enforce
-//      that remote limit during this command.
+// Daily status and commits use the same economy service as the Collection API.
 
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
 import {
   SlashCommandBuilder,
   EmbedBuilder,
@@ -27,7 +23,9 @@ import {
   ButtonStyle,
   ComponentType
 } from 'discord.js';
-import { loadJSON, saveJSON, PATHS } from '../utils/storageClient.js';
+import { loadJSON, PATHS } from '../utils/storageClient.js';
+import { getSellStatus, sellCards } from '../utils/economyService.js';
+import { ensureLinkedToken, PlayerLinks } from '../utils/playerLinks.js';
 import { requireSupporter } from '../utils/roleGuard.js';
 
 /* ───────────────────────── Config helpers ───────────────────────── */
@@ -74,46 +72,8 @@ const to3 = v => String(v).padStart(3, '0');
 const todayUTC = () => new Date().toISOString().slice(0, 10);
 const clamp = (n, a, b) => Math.min(Math.max(n, a), b);
 
-function buildCollectionUrl(cfg, token) {
-  const collectionBase =
-    cfg.collection_ui ||
-    cfg.ui_urls?.card_collection_ui ||
-    cfg.frontend_url ||
-    cfg.ui_base ||
-    cfg.UI_BASE ||
-    'https://madv313.github.io/Card-Collection-UI';
-
-  const API_BASE   = trim(cfg.api_base || cfg.API_BASE || process.env.API_BASE || '');
-  const IMAGE_BASE = trim(cfg.image_base || cfg.IMAGE_BASE || 'https://madv313.github.io/Card-Collection-UI/images/cards');
-
-  const qp = new URLSearchParams();
-  qp.set('token', token);
-  if (API_BASE)   qp.set('api', API_BASE);
-  if (IMAGE_BASE) qp.set('imgbase', IMAGE_BASE);
-  qp.set('ts', String(Date.now()));
-
-  return `${trim(collectionBase)}/index.html?${qp.toString()}`;
-}
-
-// Live status from backend (usedToday/remaining/limit/reset)
-// Returns {soldToday, soldRemaining, limit, resetAtISO} or null.
-async function fetchSellStatus(apiBase, token) {
-  try {
-    if (!apiBase || !token) return null;
-    const url = `${apiBase}/me/${encodeURIComponent(token)}/sell/status`;
-    const r = await fetch(url, { cache: 'no-store' });
-    if (!r.ok) return null;
-    const j = await r.json();
-    if (typeof j?.soldRemaining === 'undefined') return null;
-    return {
-      soldToday: Number(j.soldToday || 0),
-      soldRemaining: Number(j.soldRemaining || 0),
-      limit: Number(j.limit || DEFAULT_DAILY_LIMIT),
-      resetAtISO: j.resetAtISO || null
-    };
-  } catch {
-    return null;
-  }
+function buildCollectionUrl(_cfg, token) {
+  return PlayerLinks.collection(token);
 }
 
 /* ───────────────────────── Command ───────────────────────── */
@@ -123,11 +83,12 @@ export default async function registerSellCard(client) {
   const MANAGE_CARDS_CHANNEL_ID =
     String(CFG.manage_cards_channel_id || CFG.manage_cards || CFG['manage-cards'] || DEFAULT_MANAGE_CARDS_CHANNEL_ID);
 
+  const configuredSellValues = CFG?.coin_system?.card_sell_values || {};
   const sellValues = {
-    common:    Number(CFG?.coin_system?.card_sell_values?.common    ?? DEFAULT_SELL.common),
-    uncommon:  Number(CFG?.coin_system?.card_sell_values?.uncommon  ?? DEFAULT_SELL.uncommon),
-    rare:      Number(CFG?.coin_system?.card_sell_values?.rare      ?? DEFAULT_SELL.rare),
-    legendary: Number(CFG?.coin_system?.card_sell_values?.legendary ?? DEFAULT_SELL.legendary),
+    common:    Number(configuredSellValues.common    ?? configuredSellValues.Common    ?? DEFAULT_SELL.common),
+    uncommon:  Number(configuredSellValues.uncommon  ?? configuredSellValues.Uncommon  ?? DEFAULT_SELL.uncommon),
+    rare:      Number(configuredSellValues.rare      ?? configuredSellValues.Rare      ?? DEFAULT_SELL.rare),
+    legendary: Number(configuredSellValues.legendary ?? configuredSellValues.Legendary ?? DEFAULT_SELL.legendary),
   };
 
   const CONFIG_LIMIT = Number(
@@ -135,9 +96,6 @@ export default async function registerSellCard(client) {
     CFG?.coin_system?.sell_limit_per_day ??
     DEFAULT_DAILY_LIMIT
   );
-
-  // We'll resolve API base once here
-  const API_BASE = trim(CFG.api_base || CFG.API_BASE || process.env.API_BASE || '');
 
   const command = new SlashCommandBuilder()
     .setName('sellcard')
@@ -190,17 +148,13 @@ export default async function registerSellCard(client) {
       if (profile.discordName !== userName) profile.discordName = userName;
       profile.collection = profile.collection || {};
 
-      // Ensure token for deep links & API status
-      if (!profile.token || typeof profile.token !== 'string' || profile.token.length < 12) {
-        profile.token = crypto.randomBytes(18).toString('base64url');
-        linked[userId] = profile;
-        try { await saveJSON(PATHS.linkedDecks, linked); } catch {}
-      }
-      const token = profile.token;
+      // Ensure/mint the viewer token through the CAS-protected shared helper.
+      const token = await ensureLinkedToken(userId, userName);
       const collectionUrl = buildCollectionUrl(CFG, token);
 
       // Try to fetch *live* status from API (reflects sales made from the UI)
-      const live = await fetchSellStatus(API_BASE, token);
+      const directStatus = await getSellStatus(userId);
+      const live = { soldToday: directStatus.used, soldRemaining: directStatus.remaining, limit: directStatus.limit, resetAtISO: directStatus.resetsAt };
       let dailyLimitNow = Number(live?.limit ?? CONFIG_LIMIT);
       let dailyUsedNow  = Number(
         live?.soldToday ??
@@ -349,7 +303,8 @@ export default async function registerSellCard(client) {
           if (!prof) return i.update({ content: 'Profile disappeared. Try again.', embeds: [], components: [] });
 
           // Re-check live status right before sale (so we respect UI sales)
-          const liveNow = await fetchSellStatus(API_BASE, token);
+          const statusNow = await getSellStatus(userId);
+          const liveNow = { soldToday: statusNow.used, soldRemaining: statusNow.remaining, limit: statusNow.limit, resetAtISO: statusNow.resetsAt };
           const limitNow = Number(liveNow?.limit ?? CONFIG_LIMIT);
           const usedNow  = Number(
             liveNow?.soldToday ??
@@ -368,41 +323,18 @@ export default async function registerSellCard(client) {
             return i.reply({ content: `You now only own **${ownedNow}** of #${selectedCard.id}.`, ephemeral: true });
           }
 
-          // Commit sale (legacy file-backed path)
-          const rarity = (rarityMap[selectedCard.id] || 'Common').toLowerCase();
-          const perCard = Number(sellValues[rarity] ?? DEFAULT_SELL.common);
-          const coinsGained = Math.round(perCard * selectedQty * 100) / 100;
-
-          prof.collection[selectedCard.id] = ownedNow - selectedQty;
-          if (prof.collection[selectedCard.id] <= 0) delete prof.collection[selectedCard.id];
-
-          const today = todayUTC();
-          const usedLegacy = (prof.sellCountDate === today) ? Number(prof.sellCountToday || 0) : 0;
-          prof.sellCountDate = today;
-          prof.sellCountToday = usedLegacy + selectedQty;
-
-          // Unified balance: prefer coin bank, fallback to prof.coins if missing
-          const currentBalance = Number(bank[userId] ?? prof.coins ?? 0);
-          const newBalance = Math.round((currentBalance + coinsGained) * 100) / 100;
-
-          bank[userId] = newBalance;          // authoritative write
-          prof.coins = newBalance;            // mirror for UIs that read linked_decks
-          prof.coinsUpdatedAt = new Date().toISOString();
-
-          linked[userId] = prof;
-
+          // Commit through the same economy service used by the Collection API.
+          // This keeps Discord and browser sales on one sells_by_day counter and CAS path.
+          let saleResult;
           try {
-            await saveJSON(PATHS.linkedDecks, linked);
-            await saveJSON(COIN_BANK_FILE, bank);
+            saleResult = await sellCards(userId, [{ id: selectedCard.id, qty: selectedQty }]);
           } catch (e) {
-            console.error('[sellcard] Persist failed:', e?.message || e);
-            return i.update({
-              content: '⚠️ Failed to save your sale. Please try again later.',
-              embeds: [],
-              components: []
-            });
+            const message = e?.message || 'Sale failed';
+            return i.reply({ content: `⚠️ ${message}`, ephemeral: true });
           }
-
+          const coinsGained = Number(saleResult.credit || 0);
+          const newBalance = Number(saleResult.balance || 0);
+          const rarity = (rarityMap[selectedCard.id] || 'Common').toLowerCase();
           // Update local counters used in the embed for any subsequent UI redraws
           dailyUsedNow  = usedNow + selectedQty;
           dailyLimitNow = limitNow;

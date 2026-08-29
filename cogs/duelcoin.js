@@ -1,12 +1,10 @@
 // cogs/duelcoin.js
 // Admin-only coin adjuster with full debug logging.
-// - Syncs coins to BOTH storage files: PATHS.wallet (legacy) + PATHS.linkedDecks (canonical)
+// - Treats coin_bank as authoritative and mirrors the balance into linked_decks for compatibility
 // - Ensures the target has a token to build a collection deep link
 // - DMs the target their new balance (graceful on failure)
 
 import fs from 'fs';
-import path from 'path';
-import crypto from 'crypto';
 import {
   SlashCommandBuilder,
   PermissionFlagsBits,
@@ -23,7 +21,8 @@ import {
 
 import { adminAlert } from '../utils/adminAlert.js';
 import { L } from '../utils/logs.js';
-import { loadJSON, saveJSON, PATHS } from '../utils/storageClient.js';
+import { loadJSON, updateJSONAtomic, PATHS } from '../utils/storageClient.js';
+import { ensureLinkedToken } from '../utils/playerLinks.js';
 
 /* ───────────────────────────── Config helpers ───────────────────────────── */
 
@@ -47,7 +46,7 @@ function resolveCollectionBase(cfg = {}) {
       cfg.frontend_url ||
       cfg.ui_base ||
       process.env.COLLECTION_UI ||
-      'https://madv313.github.io/Card-Collection-UI'
+      'https://collection.sv13tcg.com'
   );
 }
 function resolveApiBase(cfg = {}) {
@@ -56,7 +55,8 @@ function resolveApiBase(cfg = {}) {
 
 const COLLECTION_BASE = resolveCollectionBase(CFG);
 const API_BASE = resolveApiBase(CFG);
-const apiQP = API_BASE ? `&api=${encodeURIComponent(API_BASE)}` : '';
+const PASS_API_QUERY = String(process.env.PASS_API_QUERY ?? CFG.pass_api_query ?? 'false').toLowerCase() === 'true';
+const apiQP = PASS_API_QUERY && API_BASE ? `&api=${encodeURIComponent(API_BASE)}` : '';
 
 /* ───────────────────────────── Admin / Channel gates ───────────────────────────── */
 
@@ -71,25 +71,6 @@ const ADMIN_CHANNEL_ID =
 
 /* ───────────────────────────── Small utils ───────────────────────────── */
 
-function randomToken(len = 24) {
-  return crypto.randomBytes(Math.ceil((len * 3) / 4)).toString('base64url').slice(0, len);
-}
-
-async function ensureToken(linked, userId, fallbackName = 'Player') {
-  if (!linked[userId]) {
-    linked[userId] = {
-      discordName: fallbackName,
-      deck: [],
-      collection: {},
-      createdAt: new Date().toISOString(),
-    };
-  }
-  if (!linked[userId].token || String(linked[userId].token).length < 12) {
-    linked[userId].token = randomToken(24);
-  }
-  return linked[userId].token;
-}
-
 async function loadLinkedSafe() {
   try {
     return await loadJSON(PATHS.linkedDecks);
@@ -98,40 +79,6 @@ async function loadLinkedSafe() {
     throw e;
   }
 }
-async function saveLinkedSafe(data, client) {
-  try {
-    await saveJSON(PATHS.linkedDecks, data);
-  } catch (e) {
-    await adminAlert(
-      client,
-      process.env.ADMIN_PAYOUT_CHANNEL_ID || process.env.PAYOUTS_CHANNEL_ID || ADMIN_CHANNEL_ID,
-      `${PATHS.linkedDecks} save failed: ${e.message}`
-    );
-    throw e;
-  }
-}
-async function loadWalletSafe() {
-  try {
-    return await loadJSON(PATHS.wallet);
-  } catch (e) {
-    // create fresh store if missing
-    L.storage(`load fail ${PATHS.wallet}: ${e.message} (will init empty)`);
-    return {};
-  }
-}
-async function saveWalletSafe(data, client) {
-  try {
-    await saveJSON(PATHS.wallet, data);
-  } catch (e) {
-    await adminAlert(
-      client,
-      process.env.ADMIN_PAYOUT_CHANNEL_ID || process.env.PAYOUTS_CHANNEL_ID || ADMIN_CHANNEL_ID,
-      `${PATHS.wallet} save failed: ${e.message}`
-    );
-    throw e;
-  }
-}
-
 /* ───────────────────────────── Command ───────────────────────────── */
 
 export default async function registerDuelCoin(client) {
@@ -309,35 +256,49 @@ export default async function registerDuelCoin(client) {
           return modalInteraction.reply({ content: '⚠️ Invalid amount.', ephemeral: true });
         }
 
-        // Load stores
-        const wallet = await loadWalletSafe();
+        // Refresh the target identity first. The selected user came from linked_decks, so
+        // this must never create an unrelated profile.
         const linkedNow = await loadLinkedSafe();
-
-        // Ensure target + token
         const discordName =
           (await modalInteraction.client.users
             .fetch(userId)
             .then((u) => u.username)
             .catch(() => linkedNow[userId]?.discordName || 'Player')) || 'Player';
+        const token = await ensureLinkedToken(userId, discordName);
 
-        await ensureToken(linkedNow, userId, discordName);
+        // coin_bank is authoritative. CAS makes simultaneous admin adjustments additive
+        // rather than allowing a stale whole-file write to erase another adjustment.
+        let newBalance = 0;
+        await updateJSONAtomic(PATHS.wallet, bank => {
+          const fallback = Number(linkedNow[userId]?.coins ?? 0) || 0;
+          const current = Object.prototype.hasOwnProperty.call(bank, userId)
+            ? (Number(bank[userId]) || 0)
+            : fallback;
+          newBalance = mode === 'give' ? current + amount : Math.max(0, current - amount);
+          bank[userId] = newBalance;
+          return bank;
+        }, { defaultValue: {} });
 
-        const current = Number(linkedNow[userId]?.coins ?? wallet[userId] ?? 0) || 0;
-        const newBalance = mode === 'give' ? current + amount : Math.max(0, current - amount);
-
-        // Write both stores
-        linkedNow[userId].coins = newBalance;
-        linkedNow[userId].coinsUpdatedAt = new Date().toISOString();
-        wallet[userId] = newBalance;
-
-        await saveLinkedSafe(linkedNow, client);
-        await saveWalletSafe(wallet, client);
+        // Mirror into the profile for legacy consumers. Failure here does not roll back
+        // the authoritative bank or invite a duplicate adjustment; alert the admin instead.
+        try {
+          await updateJSONAtomic(PATHS.linkedDecks, current => {
+            if (!current?.[userId]) throw Object.assign(new Error('Linked profile disappeared'), { status: 409 });
+            current[userId].coins = newBalance;
+            current[userId].coinsUpdatedAt = new Date().toISOString();
+            return current;
+          }, { defaultValue: {} });
+        } catch (error) {
+          await adminAlert(
+            client,
+            process.env.ADMIN_PAYOUT_CHANNEL_ID || process.env.PAYOUTS_CHANNEL_ID || ADMIN_CHANNEL_ID,
+            `Coin bank updated for ${userId}, but linked profile mirror failed: ${error?.message || error}`
+          ).catch(() => {});
+        }
 
         // Build collection URL
         const ts = Date.now();
-        const collectionUrl = `${COLLECTION_BASE}/?token=${encodeURIComponent(
-          linkedNow[userId].token
-        )}${apiQP}&ts=${ts}`;
+        const collectionUrl = `${COLLECTION_BASE}/?token=${encodeURIComponent(token)}${apiQP}&ts=${ts}`;
 
         // Confirm in channel (non-ephemeral for audit)
         await modalInteraction.reply({

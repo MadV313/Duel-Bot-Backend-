@@ -3,10 +3,10 @@
 //
 // Uses Persistent Data API via utils/storageClient.js:
 //  - loadJSON(PATHS.linkedDecks)  // { [userId]: {discordName, token, deck, collection, coins?, ...} }
-//  - loadJSON(PATHS.wallet)       // (LEGACY) { [userId]: number }
+//  - loadJSON(PATHS.wallet)       // authoritative coin_bank { [userId]: number }
 //  - loadJSON(PATHS.playerData)   // { [userId]: {wins, losses} }
-//  - loadJSON(PATHS.coinBank)     // (NEW authoritative) { [userId]: number }
-//  - saveJSON(PATHS.linkedDecks, updatedObject)
+//  - PATHS.coinBank               // compatibility alias for PATHS.wallet
+//  - updateJSONAtomic(PATHS.linkedDecks, mutator)
 //
 // Config resolution order: ENV.CONFIG_JSON → config.json → defaults
 
@@ -21,8 +21,8 @@ import {
   ComponentType,
   EmbedBuilder,
 } from 'discord.js';
-import crypto from 'crypto';
-import { loadJSON, saveJSON, PATHS } from '../utils/storageClient.js';
+import { loadJSON, updateJSONAtomic, PATHS } from '../utils/storageClient.js';
+import { ensureLinkedToken } from '../utils/playerLinks.js';
 
 /* ───────────────────────── Config helpers ───────────────────────── */
 function loadConfig() {
@@ -47,7 +47,7 @@ const COLLECTION_BASE = (CFG.collection_ui
   || CFG.ui_urls?.card_collection_ui
   || CFG.frontend_url
   || CFG.ui_base
-  || 'https://madv313.github.io/Card-Collection-UI').replace(/\/+$/,'');
+  || 'https://collection.sv13tcg.com').replace(/\/+$/,'');
 
 const API_BASE = (CFG.api_base || CFG.API_BASE || process.env.API_BASE || '').replace(/\/+$/,'');
 
@@ -59,9 +59,6 @@ function hasAnyAdminRole(member) {
   const cache = member?.roles?.cache;
   if (!cache) return false;
   return ADMIN_ROLE_IDS.some(rid => cache.has(rid));
-}
-function randomToken(len = 24) {
-  return crypto.randomBytes(Math.ceil((len * 3) / 4)).toString('base64url').slice(0, len);
 }
 function asObject(x, fallback = {}) {
   if (!x) return fallback;
@@ -198,13 +195,13 @@ export default async function registerViewLinked(client) {
         // Ensure profile presence (should exist because it was listed)
         const prof = linkedNow[userId] || { discordName: userId, deck: [], collection: {}, createdAt: new Date().toISOString() };
 
-        // Ensure token
-        if (typeof prof.token !== 'string' || prof.token.length < 12) {
-          prof.token = randomToken(24);
-          linkedNow[userId] = prof;
-          try { await saveJSON(PATHS.linkedDecks, linkedNow); } catch (e) {
-            console.warn('[viewlinked] Failed to persist token mint:', e?.message || e);
-          }
+        // Token/name refresh is CAS-protected so admin inspection cannot overwrite
+        // concurrent collection/deck/economy changes.
+        let token;
+        try { token = await ensureLinkedToken(userId, prof.discordName || userId); }
+        catch (e) {
+          console.warn('[viewlinked] Failed to refresh linked token:', e?.message || e);
+          return interaction.followUp({ content: '⚠️ Could not refresh that profile.', ephemeral: true });
         }
 
         // Coins: prefer COIN BANK → profile → legacy wallet
@@ -213,14 +210,15 @@ export default async function registerViewLinked(client) {
         if (!Number.isFinite(coins)) coins = Number(walletNow[userId] ?? 0);
         if (!Number.isFinite(coins)) coins = 0;
 
-        // Mirror bank balance back into profile for UI consistency, if different
-        if (prof.coins !== coins) {
-          prof.coins = coins;
-          prof.coinsUpdatedAt = new Date().toISOString();
-          linkedNow[userId] = prof;
-          try { await saveJSON(PATHS.linkedDecks, linkedNow); } catch (e) {
-            console.warn('[viewlinked] Failed to mirror coins into linked_decks:', e?.message || e);
-          }
+        // Mirror bank balance without replacing the entire linked-decks snapshot.
+        if (Number(prof.coins ?? 0) !== coins) {
+          await updateJSONAtomic(PATHS.linkedDecks, current => {
+            if (current?.[userId]) {
+              current[userId].coins = coins;
+              current[userId].coinsUpdatedAt = new Date().toISOString();
+            }
+            return current;
+          }, { defaultValue: {} }).catch(e => console.warn('[viewlinked] Failed to mirror coins:', e?.message || e));
         }
 
         // Wins/losses
@@ -243,8 +241,9 @@ export default async function registerViewLinked(client) {
         // Build tokenized collection link
         const ts = Date.now();
         const qp = new URLSearchParams();
-        qp.set('token', prof.token);
-        if (API_BASE) qp.set('api', API_BASE);
+        qp.set('token', token);
+        const passApi = String(process.env.PASS_API_QUERY ?? CFG.pass_api_query ?? 'false').toLowerCase() === 'true';
+        if (passApi && API_BASE) qp.set('api', API_BASE);
         qp.set('ts', String(ts));
 
         const collectionUrl = `${COLLECTION_BASE}/?${qp.toString()}`;

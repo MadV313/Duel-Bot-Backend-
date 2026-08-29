@@ -6,19 +6,16 @@
 // - Builds URL with ?token=... (&api=... if configured) and cache-busting &ts=...
 
 import fs from 'fs';
-import crypto from 'crypto';
 import {
   SlashCommandBuilder,
   EmbedBuilder
 } from 'discord.js';
-import { loadJSON, saveJSON, PATHS } from '../utils/storageClient.js';
+import { loadJSON, PATHS } from '../utils/storageClient.js';
+import { ensureLinkedToken } from '../utils/playerLinks.js';
 
 const FALLBACK_MANAGE_CARDS_CHANNEL_ID = '1367977677658656868';
 
 const trimBase = (u = '') => String(u).trim().replace(/\/+$/, '');
-const isTokenValid = (t) => typeof t === 'string' && /^[A-Za-z0-9_-]{12,128}$/.test(t);
-const randomToken = (len = 24) =>
-  crypto.randomBytes(Math.ceil((len * 3) / 4)).toString('base64url').slice(0, len);
 
 function loadConfig() {
   try {
@@ -42,7 +39,7 @@ function resolveDeckBuilderBase(cfg) {
     cfg.frontend_url ||
     cfg.ui_base ||
     cfg.UI_BASE ||
-    'https://madv313.github.io/Deck-Builder-UI'
+    'https://deck.sv13tcg.com'
   );
 }
 
@@ -100,21 +97,11 @@ export default async function registerMyDeck(client) {
         return interaction.reply({ embeds: [warn], ephemeral: true });
       }
 
-      // Keep display name fresh
-      if (profile.discordName !== username) {
-        profile.discordName = username;
-      }
-
-      // Ensure token
-      if (!isTokenValid(profile.token)) {
-        profile.token = randomToken(24);
-      }
-
-      // Persist any self-heal updates quietly
-      try {
-        await saveJSON(PATHS.linkedDecks, { ...linked, [userId]: profile });
-      } catch (e) {
-        console.warn('[mydeck] Failed to persist profile updates:', e?.message || e);
+      let token;
+      try { token = await ensureLinkedToken(userId, username); }
+      catch (error) {
+        console.warn('[mydeck] Failed to refresh player identity:', error?.message || error);
+        return interaction.reply({ content: '⚠️ Could not refresh your profile. Please try again.', ephemeral: true });
       }
 
       const DECK_BUILDER_BASE = resolveDeckBuilderBase(CFG);
@@ -122,8 +109,9 @@ export default async function registerMyDeck(client) {
       const ts = Date.now();
 
       const qp = new URLSearchParams();
-      qp.set('token', profile.token);
-      if (API_BASE) qp.set('api', API_BASE);
+      qp.set('token', token);
+      const passApi = String(process.env.PASS_API_QUERY ?? CFG.pass_api_query ?? 'false').toLowerCase() === 'true';
+      if (passApi && API_BASE) qp.set('api', API_BASE);
       qp.set('ts', String(ts));
 
       const deckUrl = `${DECK_BUILDER_BASE}/?${qp.toString()}`;

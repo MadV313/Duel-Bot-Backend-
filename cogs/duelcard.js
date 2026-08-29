@@ -9,7 +9,8 @@
 //  • NEW: DM the target user with the same embed+link; notify admins if DM fails
 //  • PERSISTENCE: linked_decks.json is loaded/saved REMOTELY via storageClient with [STORAGE] logs + adminAlert
 
-import fs from 'fs/promises';              // kept for local CoreMasterReference read
+import fs from 'fs/promises';
+import fsSync from 'fs';              // kept for local CoreMasterReference read
 import path from 'path';
 import {
   SlashCommandBuilder,
@@ -21,9 +22,10 @@ import {
   ComponentType,
   EmbedBuilder
 } from 'discord.js';
-import crypto from 'crypto';
 
-import { loadJSON, saveJSON, PATHS } from '../utils/storageClient.js';
+import { loadJSON, updateJSONAtomic, PATHS } from '../utils/storageClient.js';
+import { ensureLinkedToken } from '../utils/playerLinks.js';
+import { config } from '../utils/config.js';
 import { adminAlert } from '../utils/adminAlert.js';
 import { L } from '../utils/logs.js';
 
@@ -42,7 +44,7 @@ function loadConfig() {
   }
   try {
     // eslint-disable-next-line import/no-dynamic-require, global-require
-    return JSON.parse(require('fs').readFileSync('config.json', 'utf-8')) || {};
+    return JSON.parse(fsSync.readFileSync('config.json', 'utf-8')) || {};
   } catch {
     return {};
   }
@@ -55,7 +57,7 @@ function resolveCollectionBase(cfg) {
     cfg.frontend_url ||
     cfg.ui_base ||
     cfg.UI_BASE ||
-    'https://madv313.github.io/Card-Collection-UI'
+    'https://collection.sv13tcg.com'
   );
 }
 function resolveApiBase(cfg) {
@@ -63,7 +65,7 @@ function resolveApiBase(cfg) {
 }
 function resolveImageBase(cfg) {
   // Default to the front-end repo where images live; override with CONFIG.image_base if you like
-  return trimBase(cfg.image_base || cfg.IMAGE_BASE || 'https://madv313.github.io/Card-Collection-UI/images/cards');
+  return trimBase(cfg.image_base || cfg.IMAGE_BASE || 'https://sv13tcg.com/assets/cards');
 }
 
 /* ---------------- Utility helpers ---------------- */
@@ -75,9 +77,6 @@ function sanitize(s = '') {
 }
 function makeFilename(id3, name, type) {
   return `${pad3(id3)}_${sanitize(name || 'Card')}_${sanitize(type || 'Unknown')}.png`;
-}
-function randomToken(len = 24) {
-  return crypto.randomBytes(Math.ceil((len * 3) / 4)).toString('base64url').slice(0, len);
 }
 function normalizeCollectionMap(collection = {}) {
   const out = {};
@@ -97,20 +96,13 @@ async function _loadJSONSafe(name) {
   try { return await loadJSON(name); }
   catch (e) { L.storage(`load fail ${name}: ${e.message}`); throw e; }
 }
-async function _saveJSONSafe(name, data, client) {
-  try { await saveJSON(name, data); }
-  catch (e) {
-    await adminAlert(client, process.env.PAYOUTS_CHANNEL_ID, `${name} save failed: ${e.message}`);
-    throw e;
-  }
-}
-
 export default async function registerDuelCard(client) {
   const CFG = loadConfig();
   const COLLECTION_BASE = resolveCollectionBase(CFG);
   const API_BASE = resolveApiBase(CFG);
   const IMAGE_BASE = resolveImageBase(CFG);
-  const apiQP = API_BASE ? `&api=${encodeURIComponent(API_BASE)}` : '';
+  const passApi = String(process.env.PASS_API_QUERY ?? CFG.pass_api_query ?? 'false').toLowerCase() === 'true';
+  const apiQP = passApi && API_BASE ? `&api=${encodeURIComponent(API_BASE)}` : '';
 
   const commandData = new SlashCommandBuilder()
     .setName('duelcard')
@@ -245,23 +237,17 @@ export default async function registerDuelCard(client) {
 
           console.log(`[${timestamp}] 🎯 ${executor} selected ${targetName} (${targetId})`);
 
-          // Safety: if profile missing (shouldn't happen), initialize
+          // The menu is built from linked profiles. If one was removed while the menu was
+          // open, do not silently recreate it with a partial schema.
           if (!playerProfile) {
-            playerProfile = {
-              discordName: (await interaction.client.users.fetch(targetId).catch(() => null))?.username || targetName,
-              deck: [],
-              collection: {},
-              createdAt: new Date().toISOString()
-            };
-            linkedData[targetId] = playerProfile;
-            targetName = playerProfile.discordName;
+            return interaction.editReply({ content: '⚠️ That linked profile changed while this menu was open. Run **/duelcard** again.' });
           }
 
-          // Ensure token for the player (for collection UI deep link)
-          if (!playerProfile.token || typeof playerProfile.token !== 'string' || playerProfile.token.length < 12) {
-            playerProfile.token = randomToken(24);
-            try { await _saveJSONSafe(PATHS.linkedDecks, linkedData, client); }
-            catch { return interaction.editReply({ content: '⚠️ Failed to persist player token.' }); }
+          let token;
+          try { token = await ensureLinkedToken(targetId, playerProfile.discordName || targetName); }
+          catch (error) {
+            console.warn('[duelcard] Failed to refresh player token:', error?.message || error);
+            return interaction.editReply({ content: '⚠️ Failed to refresh the player profile.' });
           }
 
           // Load card data (LOCAL read OK)
@@ -365,33 +351,36 @@ export default async function registerDuelCard(client) {
             }
 
             const cardId3 = pad3(selectedId);
-            const player = linkedData[targetId];
-            const collection = normalizeCollectionMap(player.collection || {});
             const selectedCard = filteredCards.find(c => c.card_id === cardId3) ||
                                  cardData.find(c => pad3(c.card_id) === cardId3) || {};
 
-            if (actionMode === 'give') {
-              collection[cardId3] = Number(collection[cardId3] || 0) + 1;
-            } else {
-              if (!collection[cardId3]) {
-                return cardSelect.reply({ content: '⚠️ That player doesn’t own this card.', ephemeral: true });
-              }
-              collection[cardId3] = Number(collection[cardId3] || 0) - 1;
-              if (collection[cardId3] <= 0) delete collection[cardId3];
-            }
-
-            player.collection = collection;
-
-            // Ensure token still present
-            if (!player.token || typeof player.token !== 'string' || player.token.length < 12) {
-              player.token = randomToken(24);
-            }
-
-            // REMOTE save linked decks
+            // Apply only this player's collection delta with CAS. The old whole-file save
+            // could erase a simultaneous pack, sell, trade, or deck update.
             try {
-              await _saveJSONSafe(PATHS.linkedDecks, linkedData, client);
-            } catch {
-              return cardSelect.reply({ content: '⚠️ Failed to persist update to linked_decks.json.', ephemeral: true });
+              await updateJSONAtomic(PATHS.linkedDecks, current => {
+                const player = current?.[targetId];
+                if (!player) throw Object.assign(new Error('Linked profile no longer exists.'), { status: 404 });
+                const collection = normalizeCollectionMap(player.collection || {});
+                if (actionMode === 'give') {
+                  const total = Object.entries(collection).reduce((sum, [id, qty]) =>
+                    sum + (id === '000' ? 0 : Math.max(0, Number(qty) || 0)), 0);
+                  if (total >= config.coin_system.max_card_collection_size) {
+                    throw Object.assign(new Error(`Collection capacity is ${config.coin_system.max_card_collection_size} cards.`), { status: 409 });
+                  }
+                  collection[cardId3] = Number(collection[cardId3] || 0) + 1;
+                } else {
+                  if (Number(collection[cardId3] || 0) <= 0) {
+                    throw Object.assign(new Error('That player no longer owns this card.'), { status: 409 });
+                  }
+                  collection[cardId3] = Number(collection[cardId3] || 0) - 1;
+                  if (collection[cardId3] <= 0) delete collection[cardId3];
+                }
+                player.collection = collection;
+                current[targetId] = player;
+                return current;
+              }, { defaultValue: {} });
+            } catch (error) {
+              return cardSelect.reply({ content: `⚠️ ${error?.message || 'Failed to persist linked profile update.'}`, ephemeral: true });
             }
 
             const verb = actionMode === 'give' ? 'given to' : 'taken from';
@@ -411,7 +400,7 @@ export default async function registerDuelCard(client) {
 
             // Build collection link (always ts param; add &new=... only on GIVE)
             const ts = Date.now();
-            const baseLink = `${COLLECTION_BASE}/?token=${encodeURIComponent(player.token)}${apiQP}`;
+            const baseLink = `${COLLECTION_BASE}/?token=${encodeURIComponent(token)}${apiQP}`;
             const collectionUrl = actionMode === 'give'
               ? `${baseLink}&new=${encodeURIComponent(cardId3)}&ts=${ts}`
               : `${baseLink}&ts=${ts}`;

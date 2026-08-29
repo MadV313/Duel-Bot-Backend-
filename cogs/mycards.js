@@ -3,19 +3,16 @@
 // - Restricted to #manage-cards
 // - Requires linked profile (prompts to /linkdeck if missing)
 // - Ensures/mints per-user token and persists it
-// - Builds URL with ?token=... &api=... &me=... &imgbase=... &ts=...
+// - Builds URL with the viewer token; api= remains an opt-in migration override; no browser-facing me=
 
 import fs from 'fs';
-import crypto from 'crypto';
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
-import { loadJSON, saveJSON, PATHS } from '../utils/storageClient.js';
+import { loadJSON, PATHS } from '../utils/storageClient.js';
+import { ensureLinkedToken } from '../utils/playerLinks.js';
 
 const FALLBACK_MANAGE_CARDS_CHANNEL_ID = '1367977677658656868';
 
 const trimBase = (u = '') => String(u).trim().replace(/\/+$/, '');
-const randomToken = (len = 24) =>
-  crypto.randomBytes(Math.ceil((len * 3) / 4)).toString('base64url').slice(0, len);
-
 function loadConfig() {
   try {
     if (process.env.CONFIG_JSON) return JSON.parse(process.env.CONFIG_JSON);
@@ -37,20 +34,10 @@ function resolveCollectionBase(cfg) {
     cfg.frontend_url ||
     cfg.ui_base ||
     cfg.UI_BASE ||
-    'https://madv313.github.io/Card-Collection-UI'
+    'https://collection.sv13tcg.com'
   );
 }
 
-// NEW: prefer explicit me_base from config/env; fallback empty (UI will then try API_BASE)
-function resolveMeBase(cfg) {
-  return trimBase(
-    cfg.me_base ||
-    cfg.ME_BASE ||
-    process.env.ME_BASE ||
-    process.env.PERSISTENT_DATA_BASE || // alt env name if you used this earlier
-    '' // if blank, CCUI will fall back to API_BASE (not ideal, but safe)
-  );
-}
 
 export default async function registerMyCards(client) {
   const commandData = new SlashCommandBuilder()
@@ -96,38 +83,30 @@ export default async function registerMyCards(client) {
         });
       }
 
-      // Keep display name fresh
-      if (profile.discordName !== userName) {
-        profile.discordName = userName;
-      }
-
-      // Ensure token exists (self-heal if missing)
-      if (typeof profile.token !== 'string' || profile.token.length < 12) {
-        profile.token = randomToken(24);
-        console.log(`🔑 [mycards] Minted token for ${userName} (${userId})`);
-      }
-
-      // Persist any profile updates quietly
+      // Keep identity/token updates on the same CAS-protected linked profile contract
+      // used by the rest of the repaired bot. This avoids overwriting concurrent pack,
+      // sell, trade, or deck updates with a stale whole-file snapshot.
+      let token;
       try {
-        await saveJSON(PATHS.linkedDecks, { ...linked, [userId]: profile });
-      } catch (e) {
-        console.warn('[mycards] Failed to persist profile updates:', e?.message || e);
+        token = await ensureLinkedToken(userId, userName);
+      } catch (error) {
+        console.warn('[mycards] Failed to refresh profile identity:', error?.message || error);
+        return interaction.reply({
+          content: '❌ Your profile could not be refreshed right now. Please try again.',
+          ephemeral: true
+        });
       }
 
       const BASE       = resolveCollectionBase(CFG);
       const page       = /\.(html?)$/i.test(BASE) ? BASE : `${BASE}/index.html`;
       const API_BASE   = trimBase(CFG.api_base   || CFG.API_BASE   || process.env.API_BASE   || '');
-      const IMAGE_BASE = trimBase(CFG.image_base || CFG.IMAGE_BASE || 'https://madv313.github.io/Card-Collection-UI/images/cards');
-
-      // ✅ NEW: ME base (persistent-data service hosting /me/:token/*)
-      const ME_BASE    = resolveMeBase(CFG);
+      const IMAGE_BASE = trimBase(CFG.image_base || CFG.IMAGE_BASE || 'https://sv13tcg.com/assets/cards');
 
       const ts = Date.now();
 
       const qp = new URLSearchParams();
-      qp.set('token', profile.token);
-      if (API_BASE)   qp.set('api', API_BASE);
-      if (ME_BASE)    qp.set('me', ME_BASE); // <-- critical so CCUI hits the right service
+      qp.set('token', token);
+      if (String(process.env.PASS_API_QUERY || '').toLowerCase() === 'true' && API_BASE) qp.set('api', API_BASE);
       if (IMAGE_BASE) qp.set('imgbase', IMAGE_BASE);
       qp.set('ts', String(ts));
 

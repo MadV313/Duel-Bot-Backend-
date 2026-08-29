@@ -6,19 +6,16 @@
 // - Builds URL with ?token=... (&api=... if configured) and cache-busting &ts=...
 
 import fs from 'fs';
-import crypto from 'crypto';
 import {
   SlashCommandBuilder,
   EmbedBuilder
 } from 'discord.js';
-import { loadJSON, saveJSON, PATHS } from '../utils/storageClient.js';
+import { loadJSON, PATHS } from '../utils/storageClient.js';
+import { ensureLinkedToken } from '../utils/playerLinks.js';
 
 const FALLBACK_BATTLEFIELD_CHANNEL_ID = '1367986446232719484';
 
 const trimBase = (u = '') => String(u).trim().replace(/\/+$/, '');
-const isTokenValid = (t) => typeof t === 'string' && /^[A-Za-z0-9_-]{12,128}$/.test(t);
-const randomToken = (len = 24) =>
-  crypto.randomBytes(Math.ceil((len * 3) / 4)).toString('base64url').slice(0, len);
 
 function loadConfig() {
   try {
@@ -50,7 +47,7 @@ function resolveStatsBase(cfg) {
     cfg.frontend_url ||
     cfg.ui_base ||
     cfg.UI_BASE ||
-    'https://madv313.github.io/Player-Stats-UI'
+    'https://stats.sv13tcg.com'
   );
   return trimBase(normalizeStatsBase(base));
 }
@@ -102,19 +99,11 @@ export default async function registerMyStats(client) {
         });
       }
 
-      // Keep display name fresh
-      if (profile.discordName !== username) {
-        profile.discordName = username;
-      }
-
-      // Ensure token (self-heal & persist)
-      if (!isTokenValid(profile.token)) {
-        profile.token = randomToken(24);
-      }
-      try {
-        await saveJSON(PATHS.linkedDecks, { ...linked, [userId]: profile });
-      } catch (e) {
-        console.warn('[mystats] Failed to persist profile/token updates:', e?.message || e);
+      let token;
+      try { token = await ensureLinkedToken(userId, username); }
+      catch (error) {
+        console.warn('[mystats] Failed to refresh player identity:', error?.message || error);
+        return interaction.reply({ content: '⚠️ Could not refresh your profile. Please try again.', ephemeral: true });
       }
 
       const STATS_BASE = resolveStatsBase(CFG);
@@ -122,8 +111,9 @@ export default async function registerMyStats(client) {
       const ts = Date.now();
 
       const qp = new URLSearchParams();
-      qp.set('token', profile.token);
-      if (API_BASE) qp.set('api', API_BASE);
+      qp.set('token', token);
+      const passApi = String(process.env.PASS_API_QUERY ?? CFG.pass_api_query ?? 'false').toLowerCase() === 'true';
+      if (passApi && API_BASE) qp.set('api', API_BASE);
       qp.set('ts', String(ts));
 
       const statsUrl = `${STATS_BASE}/?${qp.toString()}`;
