@@ -1,28 +1,25 @@
 // server.js
 
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import fs from 'fs';
 import fsPromises from 'fs/promises';
-import path, { dirname } from 'path';
+import path from 'path';
 import {
   Client, GatewayIntentBits, Events, Collection,
   REST, Routes, SlashCommandBuilder
 } from 'discord.js';
-import { fileURLToPath, pathToFileURL } from 'url';
-import { config as dotenvConfig } from 'dotenv';
+import { pathToFileURL } from 'url';
 import duelRoutes, { botAlias as botPracticeAlias } from './routes/duel.js';
 
 // Optional routes used elsewhere in your repo
-import duelStartRoutes from './routes/duelStart.js';
 import summaryRoutes from './routes/duelSummary.js';
-import liveRoutes from './routes/duelLive.js';
-import userStatsRoutes from './routes/userStats.js';
+import userRoutes from './routes/user.js';
+import leaderboardRoutes from './routes/leaderboard.js';
 import cardRoutes from './routes/packReveal.js';
-import collectionRoute from './routes/collection.js';
-import revealRoute from './routes/reveal.js';
 
 // 🔐 Token-aware routes (/me/:token/collection, /me/:token/stats, POST /me/:token/sell)
 import meTokenRouter from './routes/meToken.js';
@@ -31,9 +28,11 @@ import meTokenRouter from './routes/meToken.js';
 import createTradeRouter from './routes/trade.js';
 
 // 🧰 Persistent storage client (health check & optional debug endpoint)
-import { loadJSON, saveJSON, PATHS } from './utils/storageClient.js';
+import { healthCheck, loadJSON, loadOrInitJSON, PATHS } from './utils/storageClient.js';
+import { config } from './utils/config.js';
+import { getPlayerProfileByUserId, resolveUserIdByToken } from './utils/deckUtils.js';
+import { getSession } from './logic/duelSessions.js';
 
-dotenvConfig();
 
 /* ──────────────────────────────────────────────────────────
  * ✨ NEW: socket.io chat imports
@@ -49,9 +48,6 @@ import {
 /* ──────────────────────────────────────────────────────────
  * Paths / App
  * ────────────────────────────────────────────────────────── */
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = dirname(__filename);
-
 const app  = express();
 const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 1);
@@ -75,7 +71,7 @@ const guildId   = process.env.GUILD_ID;
 const SAFE_MODE = process.env.SAFE_MODE === 'true';
 const SYNC_SCOPE = (process.env.SYNC_SCOPE || 'guild').toLowerCase(); // 'guild' (default) or 'global'
 const LAST_RESORT_GLOBAL = String(process.env.LAST_RESORT_GLOBAL || 'false').toLowerCase() === 'true';
-const DEBUG_KEY = process.env.X_BOT_KEY || process.env.BOT_KEY || process.env.ADMIN_KEY || ''; // for /debug endpoints
+const DEBUG_KEY = process.env.DEBUG_KEY || ''; // debug routes are closed when this is unset
 
 console.log('🔍 ENV CHECK:', { hasToken: !!token, clientId: envClient, guildId, SAFE_MODE, SYNC_SCOPE, LAST_RESORT_GLOBAL });
 
@@ -268,14 +264,18 @@ async function listDiscordCommands(scope, clientId) {
       await loadCommands();
     }
 
-    // 🔎 Persistent storage health check (non-fatal)
+    // Persistent storage health check is read-only. Do not mix deployment/debug
+    // metadata into player_data.json or any gameplay ledger.
     try {
-      const testRead = await loadJSON(PATHS.linkedDecks).catch(() => ({}));
-      const health = { ok: true, at: new Date().toISOString(), hasLinkedDecks: !!testRead && typeof testRead === 'object' };
-      const stats = await loadJSON(PATHS.duelStats).catch(() => ({}));
-      stats.lastStorageHealth = health;
-      await saveJSON(PATHS.duelStats, stats);
-      console.log('🗄️ [storage] health OK:', health);
+      const ok = await healthCheck();
+      if (!ok) console.warn('⚠️ [storage] /_health did not report healthy.');
+      else {
+        const testRead = await loadJSON(PATHS.linkedDecks).catch(() => null);
+        // Session index is a new Repo #2 runtime file under the Repo #1-approved
+        // summaries namespace. Initialize it once at boot before concurrent sessions.
+        await loadOrInitJSON(PATHS.duelSessionIndex, {});
+        console.log('🗄️ [storage] health OK:', { hasLinkedDecks: !!testRead && typeof testRead === 'object', sessionIndexReady: true });
+      }
     } catch (e) {
       console.warn('⚠️ [storage] health check failed:', e?.message || e);
     }
@@ -323,46 +323,43 @@ process.on('uncaughtException', e => console.error('⚠️ UncaughtException:', 
  * Express middleware (CORS hardening for Spectator UI)
  * ────────────────────────────────────────────────────────── */
 const corsOrigins = [
-  'https://madv313.github.io',
-  /localhost:5173$/,
-  /duel-ui-production\.up\.railway\.app$/,
-  /duel-bot-production\.up\.railway\.app$/,
+  'https://sv13tcg.com',
+  'https://collection.sv13tcg.com',
+  'https://deck.sv13tcg.com',
+  'https://duel.sv13tcg.com',
+  'https://spectate.sv13tcg.com',
+  'https://summary.sv13tcg.com',
+  'https://stats.sv13tcg.com',
+  'https://leaderboard.sv13tcg.com',
+  'https://packs.sv13tcg.com',
+  'https://rules.sv13tcg.com',
+  /^http:\/\/localhost(?::\d+)?$/,
+  /^http:\/\/127\.0\.0\.1(?::\d+)?$/,
+  ...config.cors_extra_origins,
 ];
+if (config.cors_allow_legacy_github) corsOrigins.push('https://madv313.github.io');
 
 const corsOptions = {
   origin: corsOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  // ⬇⬇⬇ include both normal & lowercase to satisfy strict preflights
   allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-    'X-Bot-Key',
-    'X-Player-Token',
-    'X-Match-Id',
-    'X-Mode',
-    'X-App-Client',
-    'X-Requested-With',
-    'Cache-Control', 'cache-control',
-    'If-None-Match', 'if-none-match',
-    'Pragma', 'pragma'
+    'Content-Type', 'Authorization', 'X-Bot-Key', 'X-Player-Token',
+    'X-Match-Id', 'X-Mode', 'X-App-Client', 'X-Requested-With',
+    'Cache-Control', 'If-None-Match', 'If-Match', 'Pragma'
   ],
   exposedHeaders: ['X-Match-Id', 'ETag', 'Cache-Control'],
   optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
-// 🔁 Be explicit about preflights for the hot endpoints Spectator UI hits
 app.options('*', cors(corsOptions));
-app.options(['/api/duel/state', '/api/duel/current', '/duel/state', '/duel/current'], cors(corsOptions));
-
 app.use(helmet());
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: process.env.API_JSON_LIMIT || '512kb' }));
 
 // Base limiter (used via wrappers below)
 const baseLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  limit: 100,
+  windowMs: Math.max(10_000, Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000)),
+  max: Math.max(20, Number(process.env.RATE_LIMIT_MAX || 180)),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: '🚫 Too many requests. Please try again later.' }
@@ -373,10 +370,8 @@ function isSpectatorStatePath(req) {
   const u = req.originalUrl || req.url || '';
   const isGet = req.method === 'GET';
   return isGet && (
-    /\/duel\/state(\?|$)/.test(u) ||
-    /\/duel\/current(\?|$)/.test(u) ||
-    /\/api\/duel\/state(\?|$)/.test(u) ||
-    /\/api\/duel\/current(\?|$)/.test(u)
+    /\/(?:api\/)?duel\/[^/?]+\/(?:state|spectator)(?:\?|$)/.test(u) ||
+    /\/(?:api\/)?duel\/(?:state|current)(?:\?|$)/.test(u)
   );
 }
 const apiLimiterExceptState = (req, res, next) => {
@@ -388,7 +383,13 @@ const apiLimiterExceptState = (req, res, next) => {
  * Health + route inventory + debug
  * ────────────────────────────────────────────────────────── */
 app.get('/health', (_req, res) => res.type('text/plain').send('ok'));
-app.get('/_routes', (_req, res) => {
+function requireDebug(req, res, next) {
+  if (!DEBUG_KEY) return res.status(404).json({ error: 'not found' });
+  const supplied = String(req.get('X-Debug-Key') || req.get('X-Bot-Key') || '');
+  if (supplied !== DEBUG_KEY) return res.status(403).json({ error: 'forbidden' });
+  next();
+}
+app.get('/_routes', requireDebug, (_req, res) => {
   const list = [];
   app._router?.stack?.forEach(layer => {
     if (layer.route?.path) {
@@ -404,14 +405,13 @@ app.get('/_routes', (_req, res) => {
 });
 
 // Our local view of commands we’re trying to register
-app.get('/_slash', (_req, res) => {
+app.get('/_slash', requireDebug, (_req, res) => {
   res.json({ count: bot.slashData.length, names: summarizeSlashData(bot.slashData) });
 });
 
 // 🔧 Debug: query DISCORD for what commands exist right now (guild + global)
-app.get('/debug/discord-commands', async (req, res) => {
+app.get('/debug/discord-commands', requireDebug, async (req, res) => {
   try {
-    if (DEBUG_KEY && req.headers['x-bot-key'] !== DEBUG_KEY) return res.status(403).json({ error: 'forbidden' });
     const clientId = envClient || bot.application?.id;
     const guild = await listDiscordCommands('guild', clientId);
     const global = await listDiscordCommands('global', clientId);
@@ -422,9 +422,8 @@ app.get('/debug/discord-commands', async (req, res) => {
 });
 
 // 🔧 Debug: force a resync via HTTP (use X-Bot-Key)
-app.post('/debug/resync', async (req, res) => {
+app.post('/debug/resync', requireDebug, async (req, res) => {
   try {
-    if (DEBUG_KEY && req.headers['x-bot-key'] !== DEBUG_KEY) return res.status(403).json({ error: 'forbidden' });
     const out = await bot.syncCommands();
     res.json(out);
   } catch (e) {
@@ -433,15 +432,14 @@ app.post('/debug/resync', async (req, res) => {
 });
 
 // 🧪 Storage status (non-sensitive; OK for basic diagnostics)
-app.get('/_storage', async (_req, res) => {
+app.get('/_storage', requireDebug, async (_req, res) => {
   try {
     const linked = await loadJSON(PATHS.linkedDecks).catch(() => ({}));
-    const stats  = await loadJSON(PATHS.duelStats).catch(() => ({}));
     res.json({
-      ok: true,
-      keys: Object.keys(PATHS),
-      linked_keys: Object.keys(linked).length,
-      lastStorageHealth: stats.lastStorageHealth || null
+      ok: await healthCheck(),
+      linkedProfiles: Object.keys(linked || {}).length,
+      storageConfigured: !!process.env.PERSISTENT_DATA_URL,
+      storageKeyConfigured: !!process.env.STORAGE_KEY
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -452,61 +450,48 @@ app.get('/_storage', async (_req, res) => {
  * Routes
  * ────────────────────────────────────────────────────────── */
 
-// Apply limiter on both legacy and API-prefixed paths (but exempt spectator-safe GETs)
-app.use('/duel', apiLimiterExceptState);
-app.use('/packReveal', baseLimiter);
-app.use('/user', baseLimiter);
-app.use('/collection', baseLimiter);
-app.use('/reveal', baseLimiter);
-app.use('/me', baseLimiter);
-app.use('/userStatsToken', baseLimiter);
-app.use('/trade', baseLimiter);
-
-// ✅ NEW: protect API/me namespace as well (so Hub stats/collection don’t 404)
-app.use('/api/me', baseLimiter);
-app.use('/api/meToken', baseLimiter);
-
-// 🔔 Also protect API namespace (with spectator exemption)
+// Canonical public API lives at the root. /api aliases remain temporarily for
+// old clients during migration; API_BASE itself always means the Duel Bot root.
+for (const prefix of ['/duel','/packReveal','/user','/summary','/leaderboard','/me','/trade']) {
+  app.use(prefix, prefix === '/duel' ? apiLimiterExceptState : baseLimiter);
+}
 app.use('/api', apiLimiterExceptState);
 
-// Core feature routes (legacy mounts kept for backward compatibility)
 app.use('/duel', duelRoutes);
-app.use('/bot', botPracticeAlias);
-app.use('/duel/live', liveRoutes);
-app.use('/duel', duelStartRoutes);
+app.use('/bot', botPracticeAlias); // narrow compatibility alias; no global practice state
 app.use('/summary', summaryRoutes);
-app.use('/user', userStatsRoutes);
+app.use('/user', userRoutes);
 app.use('/packReveal', cardRoutes);
-app.use('/collection', collectionRoute);
-app.use('/reveal', revealRoute);
-
-// ✅ API-prefixed mounts so Spectator UI can call /api/duel/current
-app.use('/api/duel', duelRoutes);           // /api/duel/status, /practice, /turn, /state
-app.use('/api/duel', liveRoutes);           // /api/duel/current
-app.use('/api/duelstart', duelStartRoutes); // /api/duelstart/start
-app.use('/api/bot', botPracticeAlias);      // /api/bot/status, /practice
-
-// ✅ Token-aware endpoints at BOTH root and /api for Hub compatibility
+app.use('/leaderboard', leaderboardRoutes);
 app.use('/me', meTokenRouter);
-app.use('/meToken', meTokenRouter);   // legacy alias if router expects /meToken
-app.use('/api/me', meTokenRouter);    // <— this fixes GET /api/me/:token/stats & /collection
-app.use('/api/meToken', meTokenRouter);
 
-// Trade endpoints mounted at root (need the live Discord client for DMs)
-app.use('/', createTradeRouter(bot));
+// Temporary /api compatibility aliases. New generated links do not require them.
+app.use('/api/duel', duelRoutes);
+app.use('/api/summary', summaryRoutes);
+app.use('/api/user', userRoutes);
+app.use('/api/packReveal', cardRoutes);
+app.use('/api/leaderboard', leaderboardRoutes);
+app.use('/api/me', meTokenRouter);
 
-/* ✨ NEW: optional REST history for spectator chat */
+// Preserve the known-good trade flow; its mutating operations now use CAS.
+// Mount the same router under /api as a temporary compatibility alias for old
+// clients that historically treated API_BASE as ending in /api.
+const tradeRouter = createTradeRouter(bot);
+app.use('/', tradeRouter);
+app.use('/api', tradeRouter);
+
+// Optional REST history for spectator chat.
 app.use('/chat', chatHistoryRoutes);
 
-/* ✨ NEW: Spectator presence REST (handy for UI/debug) */
-app.get('/api/spectators/:session', (req, res) => {
+app.get(['/spectators/:session','/api/spectators/:session'], async (req, res) => {
   try {
-    const session = String(req.params.session || '').trim();
-    const { count = 0, users = [] } = getPresence(session) || {};
-    res.set('Cache-Control', 'no-store');
-    res.json({ session, count, users });
+    const sessionId = String(req.params.session || '').trim();
+    const session = await getSession(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    const { count = 0, users = [] } = getPresence(sessionId) || {};
+    res.set('Cache-Control', 'no-store').json({ session: sessionId, count, users });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -546,22 +531,11 @@ app.post('/trade/notify', express.json(), async (req, res) => {
   }
 });
 
-/* ──────────────────────────────────────────────────────────
- * Duel-UI compatibility shims
- * ────────────────────────────────────────────────────────── */
-
-// Heartbeat the UI pings on boot
-app.get('/duel/state', (_req, res) => {
-  res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, mode: 'compat', ts: Date.now() });
-});
-
-// Some UI builds post to /bot/turn; redirect to the canonical /duel/turn
-app.post('/bot/turn', (req, res) => {
-  res.redirect(307, '/duel/turn');
-});
-
-app.options('/bot/turn', cors());
+/* Old browser snapshot/turn mutation routes are intentionally retired.
+ * Repo #8 will move the Duel UI to the session/action contract. */
+app.post('/bot/turn', (_req, res) => res.status(410).json({
+  error: 'Legacy /bot/turn retired. Use /duel/:session/action; bot automation is practice-only.'
+}));
 
 app.use('/public', express.static('public'));
 
@@ -602,46 +576,64 @@ const chatNs = io.of('/spectator-chat');
 
 chatNs.on('connection', (socket) => {
   let roomId = null;
-  let userId = socket.id;
+  const presenceId = socket.id;
   let name = 'Spectator';
 
-  socket.on('join_room', (payload = {}) => {
-    roomId = (payload.roomId || '').toString();
-    userId = (payload.userId || socket.id).toString();
-    name   = (payload.name || 'Spectator').toString().slice(0, 32);
+  socket.on('join_room', async (payload = {}) => {
+    try {
+      const requestedRoom = String(payload.session || payload.roomId || '').trim();
+      if (!requestedRoom) return socket.emit('error', { error: 'session/roomId required' });
+      const session = await getSession(requestedRoom);
+      if (!session) return socket.emit('error', { error: 'Session not found' });
 
-    if (!roomId) { socket.emit('error', { error: 'roomId required' }); return; }
-    socket.join(roomId);
-    joinRoom(roomId, userId, name);
+      // A viewer token is optional. When supplied, resolve the display name on the
+      // server; never trust a browser-provided name or player identity.
+      const token = String(payload.token || '').trim();
+      name = 'Spectator';
+      if (token) {
+        const linkedId = await resolveUserIdByToken(token);
+        if (linkedId) {
+          const profile = await getPlayerProfileByUserId(linkedId);
+          name = String(profile?.discordName || 'Spectator').slice(0, 32);
+        }
+      }
 
-    // send history + presence to the joiner
-    socket.emit('history', { roomId, messages: getHistory(roomId) });
-    // broadcast presence to room
-    chatNs.to(roomId).emit('presence', { roomId, ...getPresence(roomId) });
+      if (roomId && roomId !== requestedRoom) {
+        leaveRoom(roomId, presenceId);
+        socket.leave(roomId);
+      }
+      roomId = requestedRoom;
+      socket.join(roomId);
+      joinRoom(roomId, presenceId, name);
+      socket.emit('history', { roomId, messages: getHistory(roomId) });
+      chatNs.to(roomId).emit('presence', { roomId, ...getPresence(roomId) });
+    } catch (e) {
+      socket.emit('error', { error: e?.message || 'Unable to join spectator room' });
+    }
   });
 
   socket.on('typing', (isTyping) => {
     if (!roomId) return;
-    const typingUsers = setTyping(roomId, userId, !!isTyping);
+    const typingUsers = setTyping(roomId, presenceId, !!isTyping);
     chatNs.to(roomId).emit('typing', { roomId, users: typingUsers });
   });
 
   socket.on('chat_message', (textRaw) => {
     if (!roomId) return;
     const text = String(textRaw || '').replace(/[<>]/g, '').trim();
-    if (!text) return;
-    if (text.length > 500) return; // cap
-
-    const msg = { id: `${Date.now()}_${Math.random().toString(36).slice(2,8)}`, roomId, userId, name, text, ts: Date.now() };
+    if (!text || text.length > 500) return;
+    const msg = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+      roomId, userId: presenceId, name, text, ts: Date.now()
+    };
     appendMessage(roomId, msg);
     chatNs.to(roomId).emit('message', msg);
   });
 
   socket.on('disconnect', () => {
-    if (roomId) {
-      leaveRoom(roomId, userId);
-      chatNs.to(roomId).emit('presence', { roomId, ...getPresence(roomId) });
-    }
+    if (!roomId) return;
+    leaveRoom(roomId, presenceId);
+    chatNs.to(roomId).emit('presence', { roomId, ...getPresence(roomId) });
   });
 });
 

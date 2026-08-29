@@ -1,17 +1,17 @@
 {
   "name": "sv13-duel-bot-backend",
   "version": "1.2.0",
-  "description": "Production backend for the SV13 DayZ-Themed Collectible Card Game (CCG) Duel Bot — including Discord slash commands, persistent data layer, and UI integrations.",
+  "description": "Production backend for the SV13 DayZ-Themed Collectible Card Game (CCG) Duel Bot \u2014 including Discord slash commands, persistent data layer, and UI integrations.",
   "type": "module",
   "main": "server.js",
-
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
     "lint": "eslint . --ext .js",
-    "test": "node --test"
+    "test": "node --test",
+    "check:active": "node scripts/check-active.mjs",
+    "test:recovery": "node --test test/recovery-contracts.test.js"
   },
-
   "keywords": [
     "discord",
     "sv13",
@@ -22,14 +22,11 @@
     "persistent-data",
     "railway"
   ],
-
   "author": "SV13 Development Team",
   "license": "MIT",
-
   "engines": {
     "node": ">=20.x"
   },
-
   "dependencies": {
     "cors": "^2.8.5",
     "discord.js": "^14.16.0",
@@ -42,7 +39,6 @@
     "uuid": "^9.0.1",
     "socket.io": "^4.7.5"
   },
-
   "devDependencies": {
     "nodemon": "^3.1.0",
     "eslint": "^8.57.0"

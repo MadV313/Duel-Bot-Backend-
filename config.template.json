@@ -1,91 +1,57 @@
 {
-  /* 🔐 TOKEN & AUTH */
-  "token_env": "DISCORD_TOKEN",
-  "admin_api_key": "YOUR_SECRET_ADMIN_KEY_HERE",
-  "bot_api_key": "YOUR_SECRET_BOT_API_KEY_HERE",
-
-  /* 🧑‍💼 ADMIN SETTINGS */
-  "admin_payout_channel_id": "1368023977519222895",
-  "admin_role_ids": [
-    "1173049392371085392",
-    "1184921037830373468"
-  ],
-  "founder_role_id": "1173052585830264832",
-
-  /* ⚔️ CHANNELS */
-  "battlefield_channel_id": "1367986446232719484",
-  "economy_channel_id": "1173028001085145198",
-  "manage_cards_channel_id": "1367977677658656868",
-  "manage_deck_channel_id": "1368023905964658760",
-
-  /* 💾 DATA PATHS (local fallbacks, live data stored remotely) */
-  "linked_decks_file": "./data/linked_decks.json",
-  "duel_summary_file": "./public/data/duel_summary.json",
-
-  /* 🌐 BACKEND ENDPOINTS */
-  "api_base": "https://duel-bot-production.up.railway.app",
-  /* ✅ NEW: persistent-data service that serves /me/:token/* */
-  "me_base": "https://sv13-tcg-data-production.up.railway.app",
-  "duel_backend_base_url": "https://duel-bot-production.up.railway.app",
-  "frontend_url": "https://madv313.github.io/",
-  "ui_base": "https://madv313.github.io/",
-  "pass_api_query": false,
-
-  /* 🖼️ IMAGE BASE (used by UIs as default imgbase=) */
-  "image_base": "https://madv313.github.io/Card-Collection-UI/images/cards",
-
-  /* 🎴 UI ROUTES */
+  "brand": "SV13 TCG",
+  "api_base": "https://api.sv13tcg.com",
+  "persistent_data_url": "PRIVATE_RAILWAY_STORAGE_URL_ONLY",
+  "image_base": "https://sv13tcg.com/assets/cards",
   "ui_urls": {
-    "hub_ui": "https://madv313.github.io/HUB-UI/",
-    "card_collection_ui": "https://madv313.github.io/Card-Collection-UI/",
-    "pack_reveal_ui": "https://madv313.github.io/Pack-Reveal-UI/",
-    "deck_builder_ui": "https://madv313.github.io/Deck-Builder-UI/",
-    "stats_leaderboard_ui": "https://madv313.github.io/Leaderboard-UI/",
-    "duel_summary_ui": "https://madv313.github.io/Duel-Summary-UI/",
-    "spectator_view_ui": "https://madv313.github.io/Spectator-View-UI/",
-    "duel_ui": "https://madv313.github.io/Duel-UI/"
+    "hub_ui": "https://sv13tcg.com/",
+    "card_collection_ui": "https://collection.sv13tcg.com/",
+    "deck_builder_ui": "https://deck.sv13tcg.com/",
+    "duel_ui": "https://duel.sv13tcg.com/",
+    "spectator_view_ui": "https://spectate.sv13tcg.com/",
+    "duel_summary_ui": "https://summary.sv13tcg.com/",
+    "player_stats_ui": "https://stats.sv13tcg.com/",
+    "leaderboard_ui": "https://leaderboard.sv13tcg.com/",
+    "pack_reveal_ui": "https://packs.sv13tcg.com/",
+    "rulebook_ui": "https://rules.sv13tcg.com/"
   },
-
-  /* 💰 ECONOMY CONFIG */
   "coin_system": {
     "card_pack_cost": 3,
-    "card_sell_values": {
-      "common": 0.5,
-      "uncommon": 0.5,
-      "rare": 0.5,
-      "legendary": 1
-    },
+    "cards_per_pack": 3,
     "buy_limit_per_day": 5,
     "sell_limit_per_day": 5,
     "max_card_collection_size": 250,
-    "rarity_weights": {
-      "common": 5,
-      "uncommon": 3,
-      "rare": 2,
-      "legendary": 1
+    "card_sell_values": {
+      "Common": 0.5,
+      "Uncommon": 1,
+      "Rare": 2,
+      "Legendary": 3
     },
-    "buycard_message": "Your new card pack is ready! View it here: https://madv313.github.io/Pack-Reveal-UI/"
+    "rarity_weights": {
+      "Common": 5,
+      "Uncommon": 3,
+      "Rare": 2,
+      "Legendary": 1
+    }
   },
-
-  /* 🔁 TRADE SYSTEM */
   "trade_system": {
-    "trade_limit_per_day": 3,
-    "session_ttl_hours": 24
+    "daily_initiation_limit": 3,
+    "ttl_hours": 24,
+    "max_cards_per_side": 3
   },
-
-  /* 🧠 FUTURE EXPANSION HOOKS */
-  "tournament_mode": {
-    "enabled": false,
-    "bracket_sync_url": ""
+  "deck_rules": {
+    "min_cards": 20,
+    "max_cards": 40,
+    "max_copies": 5,
+    "exclude_card_000": true
   },
-  "crafting_system": {
-    "enabled": false,
-    "fusion_cost": 5
+  "duel_rules": {
+    "starting_hp": 200,
+    "practice_counts_competitive": false
   },
-
-  /* ⚙️ META */
-  "project_name": "SV13 CCG Duel Bot Backend",
-  "version": "1.2.0",
-  "maintainer": "SV13 Development Team",
-  "last_updated": "2025-11-01"
+  "migration": {
+    "pass_api_query": false,
+    "browser_me_base_removed": true,
+    "legacy_github_cors_temporary": true
+  }
 }
