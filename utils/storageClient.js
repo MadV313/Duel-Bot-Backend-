@@ -1,208 +1,181 @@
-// utils/storageClient.js
-//
-// Persistent JSON storage client with retries, timeouts, and safe helpers.
-// ✅ Exports: loadJSON(), saveJSON(), deleteJSON(), updateJSONAtomic(), healthCheck()
-// ✅ Aliases kept: load_file(), save_file()
-// ✅ Adds: loadOrInitJSON() to silently create files with defaults on first load
-// Logs are prefixed with [STORAGE].
+// Authenticated JSON storage client for the private sv13-tcg-data service.
+// Node 20+ native fetch is used so there is one HTTP implementation.
 
-import fetch from 'node-fetch';
+const storageBase = () => String(process.env.PERSISTENT_DATA_URL || '').trim().replace(/\/+$/, '');
+const storageKey = () => String(process.env.STORAGE_KEY || '');
+const RETRIES = Math.max(0, Number(process.env.STORAGE_RETRIES || 3));
+const TIMEOUT_MS = Math.max(1000, Number(process.env.STORAGE_TIMEOUT_MS || 12000));
+const RETRY_BASE_MS = Math.max(25, Number(process.env.STORAGE_RETRY_BASE_MS || 250));
 
-const BASE = String(process.env.PERSISTENT_DATA_URL || '').replace(/\/+$/, '');
-if (!BASE) {
-  throw new Error('❌ [STORAGE] PERSISTENT_DATA_URL not set');
+export class StorageError extends Error {
+  constructor(message, { status = 0, path = '', body = '', cause } = {}) {
+    super(message, { cause });
+    this.name = 'StorageError';
+    this.status = status;
+    this.path = path;
+    this.body = body;
+  }
 }
 
-const RETRIES    = Number(process.env.STORAGE_RETRIES || 2);
-const TIMEOUT_MS = Number(process.env.STORAGE_TIMEOUT_MS || 12_000);
-const RETRY_BASE = Number(process.env.STORAGE_RETRY_BASE_MS || 400);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const baseRequired = () => {
+  const base = storageBase();
+  if (!base) throw new StorageError('PERSISTENT_DATA_URL is not configured');
+  return base;
+};
+const urlFor = filename => `${baseRequired()}/${String(filename || '').replace(/^\/+/, '')}`;
 
-function log(msg, ...a) { console.log('[STORAGE]', msg, ...a); }
-function err(msg, ...a) { console.error('[STORAGE]', msg, ...a); }
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function withTimeout(promise, ms = TIMEOUT_MS) {
-  let to;
-  const timer = new Promise((_, reject) => {
-    to = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
-  });
-  try { return await Promise.race([promise, timer]); }
-  finally { clearTimeout(to); }
+function authHeaders(extra = {}) {
+  const headers = { 'Cache-Control': 'no-store', ...extra };
+  const key = storageKey();
+  if (key) headers['X-Storage-Key'] = key;
+  return headers;
 }
 
-function urlFor(filename) {
-  const clean = String(filename || '').replace(/^\/+/, '');
-  return `${BASE}/${clean}`;
+async function request(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (cause) {
+    throw new StorageError(`Storage request failed: ${cause?.message || cause}`, { cause });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-async function parseJsonSafe(res) {
+async function parseJson(res, path) {
   const text = await res.text();
   if (!text) return {};
   try { return JSON.parse(text); }
-  catch (e) {
-    throw new Error(`Invalid JSON payload (${res.status} ${res.statusText}): ${e.message}`);
+  catch (cause) {
+    throw new StorageError(`Invalid JSON returned for ${path}`, { status: res.status, path, body: text.slice(0, 1000), cause });
   }
 }
 
-/* ─────────────────────────────────────── core ops ─────────────────────────────────────── */
+async function throwFor(res, path) {
+  const body = await res.text().catch(() => '');
+  throw new StorageError(`Storage ${res.status} for ${path}`, { status: res.status, path, body: body.slice(0, 1000) });
+}
+
+export async function loadJSONWithMeta(filename, { allowMissing = false } = {}) {
+  const url = urlFor(filename);
+  let last;
+  for (let attempt = 0; attempt <= RETRIES; attempt++) {
+    try {
+      const res = await request(url, { method: 'GET', headers: authHeaders() });
+      if (allowMissing && res.status === 404) return { data: null, etag: null, missing: true };
+      if (!res.ok) await throwFor(res, filename);
+      return { data: await parseJson(res, filename), etag: res.headers.get('etag'), missing: false };
+    } catch (error) {
+      last = error;
+      if (error?.status && error.status < 500 && ![409, 412, 429].includes(error.status)) throw error;
+      if (attempt < RETRIES) await sleep(RETRY_BASE_MS * (attempt + 1));
+    }
+  }
+  throw last;
+}
 
 export async function loadJSON(filename) {
+  return (await loadJSONWithMeta(filename)).data;
+}
+
+export async function saveJSON(filename, data, { ifMatch } = {}) {
   const url = urlFor(filename);
-  let lastErr;
+  let last;
   for (let attempt = 0; attempt <= RETRIES; attempt++) {
     try {
-      const res = await withTimeout(fetch(url, { method: 'GET', headers: { 'Cache-Control': 'no-store' } }));
-      if (!res.ok) throw new Error(`GET ${res.status} ${url}`);
-      const data = await parseJsonSafe(res);
-      log(`Loaded ${filename} successfully.`);
-      return data;
-    } catch (e) {
-      lastErr = e;
-      err(`Load failed (${attempt + 1}/${RETRIES + 1}) for ${filename}: ${e.message}`);
-      if (attempt < RETRIES) await sleep(RETRY_BASE * (attempt + 1));
+      const headers = authHeaders({ 'Content-Type': 'application/json' });
+      if (ifMatch) headers['If-Match'] = ifMatch;
+      const res = await request(url, { method: 'PUT', headers, body: JSON.stringify(data) });
+      if (!res.ok) await throwFor(res, filename);
+      let response = {};
+      try { response = await parseJson(res, filename); } catch { response = {}; }
+      return { ok: true, etag: res.headers.get('etag'), data: response };
+    } catch (error) {
+      last = error;
+      if ([409, 412].includes(error?.status)) throw error;
+      if (error?.status && error.status < 500 && error.status !== 429) throw error;
+      if (attempt < RETRIES) await sleep(RETRY_BASE_MS * (attempt + 1));
     }
   }
-  throw lastErr;
+  throw last;
 }
 
-export async function saveJSON(filename, data) {
-  const url = urlFor(filename);
-  let lastErr;
-  for (let attempt = 0; attempt <= RETRIES; attempt++) {
+export async function deleteJSON(filename, { ifMatch } = {}) {
+  const headers = authHeaders();
+  if (ifMatch) headers['If-Match'] = ifMatch;
+  const res = await request(urlFor(filename), { method: 'DELETE', headers });
+  if (res.status === 404) return false;
+  if (!res.ok) await throwFor(res, filename);
+  return true;
+}
+
+export async function updateJSONAtomic(filename, mutator, { defaultValue, retries = RETRIES } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const current = await loadJSONWithMeta(filename, { allowMissing: defaultValue !== undefined });
+    const base = current.missing ? structuredClone(defaultValue) : current.data;
+    const next = await mutator(structuredClone(base));
+    if (next === undefined) throw new StorageError(`Mutator for ${filename} returned undefined`, { path: filename });
     try {
-      const res = await withTimeout(fetch(url, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data, null, 2),
-      }));
-      if (!res.ok) throw new Error(`PUT ${res.status} ${url}`);
-      log(`Saved ${filename} successfully.`);
-      return true;
-    } catch (e) {
-      lastErr = e;
-      err(`Save failed (${attempt + 1}/${RETRIES + 1}) for ${filename}: ${e.message}`);
-      if (attempt < RETRIES) await sleep(RETRY_BASE * (attempt + 1) + 50);
+      // Missing first-write has no ETag because Repo #1 intentionally implements If-Match, not create-if-absent.
+      // Initialize canonical files during deployment to avoid this one-time race.
+      await saveJSON(filename, next, { ifMatch: current.etag || undefined });
+      return next;
+    } catch (error) {
+      if ([409, 412].includes(error?.status) && attempt < retries) {
+        await sleep(RETRY_BASE_MS * (attempt + 1));
+        continue;
+      }
+      throw error;
     }
   }
-  throw lastErr;
+  throw new StorageError(`Atomic update exhausted retries for ${filename}`, { path: filename });
 }
 
-export async function deleteJSON(filename) {
-  const url = urlFor(filename);
-  try {
-    const res = await withTimeout(fetch(url, { method: 'DELETE' }));
-    if (!res.ok) throw new Error(`DELETE ${res.status} ${url}`);
-    log(`Deleted ${filename} successfully.`);
-    return true;
-  } catch (e) {
-    err(`Delete failed for ${filename}: ${e.message}`);
-    throw e;
-  }
-}
-
-export async function updateJSONAtomic(filename, mutator) {
-  const url = urlFor(filename);
-  for (let attempt = 0; attempt <= RETRIES; attempt++) {
-    const getRes = await withTimeout(fetch(url, { method: 'GET', headers: { 'Cache-Control': 'no-store' } }));
-    if (!getRes.ok) throw new Error(`GET ${getRes.status} ${url}`);
-    const etag = getRes.headers.get('etag');
-    const current = await parseJsonSafe(getRes);
-
-    let next;
-    try { next = await mutator(current); }
-    catch (e) { err(`Mutator threw for ${filename}: ${e.message}`); throw e; }
-
-    const headers = { 'Content-Type': 'application/json' };
-    if (etag) headers['If-Match'] = etag;
-
-    const putRes = await withTimeout(fetch(url, { method: 'PUT', headers, body: JSON.stringify(next, null, 2) }));
-    if (putRes.ok) { log(`Atomic update succeeded for ${filename}.`); return true; }
-
-    if (putRes.status === 412 || putRes.status === 409) {
-      err(`Conflict updating ${filename} (attempt ${attempt + 1}). Retrying…`);
-      if (attempt < RETRIES) { await sleep(RETRY_BASE * (attempt + 1)); continue; }
-    }
-    const body = await putRes.text().catch(() => '');
-    throw new Error(`PUT ${putRes.status} ${url}: ${body || putRes.statusText}`);
-  }
-  throw new Error(`Atomic update exceeded retry budget for ${filename}`);
-}
-
-export async function healthCheck(filename = '') {
-  const url = filename ? urlFor(filename) : BASE;
-  try {
-    const res = await withTimeout(fetch(url, { method: 'HEAD' }));
-    const ok = res.ok;
-    log(`Health check ${ok ? 'OK' : 'FAIL'} for ${filename || 'BASE'} (${res.status})`);
-    return ok;
-  } catch (e) {
-    err(`Health check error for ${filename || 'BASE'}: ${e.message}`);
-    return false;
-  }
-}
-
-/* ───────────────────────────── convenience helpers ───────────────────────────── */
-
-/**
- * Load a file, and if it 404s, create it with the provided default value.
- * Useful to avoid first-boot 404 noise.
- */
 export async function loadOrInitJSON(filename, defaultValue = {}) {
-  try {
-    return await loadJSON(filename);
-  } catch (e) {
-    if (String(e.message || '').includes('GET 404')) {
-      log(`Initializing ${filename} with defaults.`);
-      await saveJSON(filename, defaultValue);
-      return defaultValue;
-    }
-    throw e;
-  }
+  const current = await loadJSONWithMeta(filename, { allowMissing: true });
+  if (!current.missing) return current.data;
+  await saveJSON(filename, defaultValue);
+  return structuredClone(defaultValue);
 }
 
-/* ───────────────────────────── aliases for legacy code ───────────────────────────── */
+export async function healthCheck() {
+  const base = storageBase();
+  if (!base) return false;
+  try {
+    const res = await request(`${base}/_health`, { method: 'GET', headers: authHeaders() });
+    return res.ok;
+  } catch { return false; }
+}
 
 export async function load_file(filename) { return loadJSON(filename); }
-export async function save_file(filename, data) { return saveJSON(filename, data); }
+export async function save_file(filename, data) { await saveJSON(filename, data); return data; }
 
-/* ───────────────────────────── canonical path map ─────────────────────────────
-   Files requiring prefix "data/":
-   - coin_bank.json
-   - linked_decks.json
-   - player_data.json
-   - sells_by_day.json
-   - trade_limits.json
-   - trade_queue.json
-   - trades.json
-   - logs/current_duel_log.json
-   - summaries/<duelID>.json
-   Also used by bot: duelStats.json (keep under data/)
-   Files requiring prefix "public/data/":
-   - duel_summaries.json
-   - reveal_<token or user id>.json
--------------------------------------------------------------------------------*/
+export const PATHS = Object.freeze({
+  linkedDecks: 'data/linked_decks.json',
+  wallet: 'data/coin_bank.json',
+  coinBank: 'data/coin_bank.json', // compatibility alias
+  playerData: 'data/player_data.json',
+  trades: 'data/trades.json',
+  tradeLimits: 'data/trade_limits.json',
+  tradeQueue: 'data/trade_queue.json',
+  sellsByDay: 'data/sells_by_day.json',
+  currentDuelLog: 'data/logs/current_duel_log.json',
+  duelLogCurrent: 'data/logs/current_duel_log.json',
+  summariesDir: 'data/summaries',
+  packRevealsDir: 'data/pack_reveals',
+  // Internal session persistence lives under the Repo #1-approved summaries prefix.
+  duelSessionsDir: 'data/summaries/_sessions',
+  duelSessionIndex: 'data/summaries/_sessions/index.json',
+  summaryFor: id => `data/summaries/${safeId(id)}.json`,
+  packRevealFor: id => `data/pack_reveals/${safeId(id)}.json`,
+  duelSessionFor: id => `data/summaries/_sessions/${safeId(id)}.json`,
+  summaryFile: id => `data/summaries/${safeId(id)}.json`, // legacy helper alias
+});
 
-export const PATHS = {
-  // core player data
-  linkedDecks:   'data/linked_decks.json',
-  wallet:        'data/coin_bank.json',         // was wallet.json in some modules
-  playerData:    'data/player_data.json',
-
-  // duels & stats
-  duelStats:     'data/duelStats.json',         // created on first boot if missing
-  currentDuelLog:'data/logs/current_duel_log.json',
-
-  // trading
-  tradeQueue:    'data/trade_queue.json',
-  tradeLimits:   'data/trade_limits.json',
-  trades:        'data/trades.json',
-  sellsByDay:    'data/sells_by_day.json',
-
-  // archives / summaries
-  summariesDir:  'data/summaries',              // use helpers below to build file paths
-  duelSummaries: 'public/data/duel_summaries.json', // public
-
-  // helpers for dynamic public files
-  revealFor: (id) => `public/data/reveal_${id}.json`,
-  summaryFor: (duelId) => `data/summaries/${duelId}.json`,
-};
+function safeId(value) {
+  const id = String(value || '');
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) throw new StorageError('Invalid storage identifier');
+  return id;
+}

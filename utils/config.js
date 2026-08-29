@@ -1,186 +1,192 @@
-// utils/config.js
-//
-// Backward-compatible config with persistent storage + helper getters.
-// - Retains ALL existing fields
-// - Adds storage + api_base knobs used across routes/utils
-// - Provides normalized getters so other modules don’t re-implement parsing
-//
+// Canonical SV13 TCG runtime configuration.
+// Resolution order for non-secret settings: ENV -> CONFIG_JSON/config.json -> defaults.
+// Secrets and private storage credentials remain ENV-only.
 
-function toNum(v, d) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-}
-function toInt(v, d) {
-  const n = parseInt(String(v), 10);
-  return Number.isFinite(n) ? n : d;
-}
-function trimTrailingSlash(u = '') {
-  return String(u).trim().replace(/\/+$/, '');
-}
-function ensureTrailingSlash(u = '') {
-  const t = trimTrailingSlash(u);
-  return t ? `${t}/` : '';
-}
-function splitCsv(v = '') {
-  return String(v).split(',').map(s => s.trim()).filter(Boolean);
-}
+import fs from 'fs';
 
-export const config = {
-  // ───────────────────────────────
-  // existing fields (unchanged)
-  // ───────────────────────────────
-  token_env: process.env.TOKEN_ENV || 'DISCORD_TOKEN',
+const trim = (v = '') => String(v || '').trim().replace(/\/+$/, '');
+const trail = (v = '') => { const t = trim(v); return t ? `${t}/` : ''; };
+const csv = (v = '') => String(v || '').split(',').map(s => s.trim()).filter(Boolean);
+const num = (v, d) => Number.isFinite(Number(v)) ? Number(v) : d;
+const int = (v, d) => Number.isFinite(parseInt(String(v), 10)) ? parseInt(String(v), 10) : d;
+const bool = (v, d = false) => v == null || v === '' ? d : String(v).toLowerCase() === 'true';
+const first = (...values) => values.find(v => v !== undefined && v !== null && v !== '');
 
-  // 🔐 Sensitive env-only fields
-  admin_api_key: process.env.ADMIN_API_KEY,
-  admin_payout_channel_id: process.env.ADMIN_PAYOUT_CHANNEL_ID,
-  admin_role_ids: splitCsv(process.env.ADMIN_ROLE_IDS || ''),
-  battlefield_channel_id: process.env.BATTLEFIELD_CHANNEL_ID,
-  economy_channel_id: process.env.ECONOMY_CHANNEL_ID,
-  founder_role_id: process.env.FOUNDER_ROLE_ID,
-  manage_cards_channel_id: process.env.MANAGE_CARDS_CHANNEL_ID,
-  manage_deck_channel_id: process.env.MANAGE_DECK_CHANNEL_ID,
+function loadLegacyConfig() {
+  try {
+    if (process.env.CONFIG_JSON) return JSON.parse(process.env.CONFIG_JSON) || {};
+  } catch (error) {
+    console.warn('[config] CONFIG_JSON parse error:', error?.message || error);
+  }
+  try {
+    if (fs.existsSync('config.json')) return JSON.parse(fs.readFileSync('config.json', 'utf8')) || {};
+  } catch (error) {
+    console.warn('[config] config.json parse error:', error?.message || error);
+  }
+  return {};
+}
+const fileConfig = loadLegacyConfig();
+const fileUi = fileConfig.ui_urls || {};
+const fileCoin = fileConfig.coin_system || {};
+const fileTrade = fileConfig.trade_system || fileConfig.trade || {};
+const fileDuel = fileConfig.duel_rules || fileConfig.duel || {};
+const fileMigration = fileConfig.migration || {};
 
-  // 🔗 External data files (legacy local paths; kept for fallback)
+export const UI = Object.freeze({
+  hub: trail(first(process.env.HUB_UI, fileUi.hub_ui, fileConfig.hub_ui, 'https://sv13tcg.com')),
+  collection: trail(first(process.env.CARD_COLLECTION_UI, process.env.COLLECTION_UI, fileUi.card_collection_ui, fileConfig.collection_ui, 'https://collection.sv13tcg.com')),
+  deckBuilder: trail(first(process.env.DECK_BUILDER_UI, process.env.DECK_UI, fileUi.deck_builder_ui, fileConfig.deck_builder_ui, 'https://deck.sv13tcg.com')),
+  duel: trail(first(process.env.DUEL_UI, fileUi.duel_ui, fileConfig.duel_ui, 'https://duel.sv13tcg.com')),
+  spectator: trail(first(process.env.SPECTATOR_VIEW_UI, process.env.SPECTATOR_UI, fileUi.spectator_view_ui, fileConfig.spectator_ui_url, 'https://spectate.sv13tcg.com')),
+  duelSummary: trail(first(process.env.DUEL_SUMMARY_UI, process.env.SUMMARY_UI, fileUi.duel_summary_ui, fileConfig.duel_summary_ui, 'https://summary.sv13tcg.com')),
+  stats: trail(first(process.env.PLAYER_STATS_UI, process.env.STATS_UI, fileUi.player_stats_ui, fileConfig.player_stats_ui, 'https://stats.sv13tcg.com')),
+  leaderboard: trail(first(process.env.LEADERBOARD_UI, process.env.STATS_LEADERBOARD_UI, fileUi.leaderboard_ui, fileUi.stats_leaderboard_ui, fileConfig.leaderboard_ui, 'https://leaderboard.sv13tcg.com')),
+  packReveal: trail(first(process.env.PACK_REVEAL_UI, fileUi.pack_reveal_ui, fileConfig.pack_reveal_ui, 'https://packs.sv13tcg.com')),
+  rules: trail(first(process.env.RULEBOOK_UI, fileUi.rulebook_ui, fileConfig.rulebook_ui, 'https://rules.sv13tcg.com')),
+});
+
+export const PATH_CONFIG = Object.freeze({
+  linkedDecks: 'data/linked_decks.json',
+  wallet: 'data/coin_bank.json',
+  playerData: 'data/player_data.json',
+  trades: 'data/trades.json',
+  tradeLimits: 'data/trade_limits.json',
+  tradeQueue: 'data/trade_queue.json',
+  sellsByDay: 'data/sells_by_day.json',
+  currentDuelLog: 'data/logs/current_duel_log.json',
+  summariesDir: 'data/summaries',
+  // Repo #1 permits data/summaries/* and intentionally does not expose a separate duel_sessions namespace.
+  duelSessionsDir: 'data/summaries/_sessions',
+  packRevealsDir: 'data/pack_reveals',
+  masterCardsLocal: 'logic/CoreMasterReference.json',
+});
+
+const fileSell = fileCoin.card_sell_values || {};
+const sellValues = Object.freeze({
+  Common: num(first(process.env.SELL_VALUE_COMMON, fileSell.Common, fileSell.common), 0.5),
+  Uncommon: num(first(process.env.SELL_VALUE_UNCOMMON, fileSell.Uncommon, fileSell.uncommon), 1),
+  Rare: num(first(process.env.SELL_VALUE_RARE, fileSell.Rare, fileSell.rare), 2),
+  Legendary: num(first(process.env.SELL_VALUE_LEGENDARY, fileSell.Legendary, fileSell.legendary), 3),
+});
+const fileWeights = fileCoin.rarity_weights || {};
+const rarityWeightsMap = Object.freeze({
+  Common: int(first(process.env.WEIGHT_COMMON, fileWeights.Common, fileWeights.common), 5),
+  Uncommon: int(first(process.env.WEIGHT_UNCOMMON, fileWeights.Uncommon, fileWeights.uncommon), 3),
+  Rare: int(first(process.env.WEIGHT_RARE, fileWeights.Rare, fileWeights.rare), 2),
+  Legendary: int(first(process.env.WEIGHT_LEGENDARY, fileWeights.Legendary, fileWeights.legendary), 1),
+});
+
+const configuredAdminRoles = process.env.ADMIN_ROLE_IDS
+  ? csv(process.env.ADMIN_ROLE_IDS)
+  : (Array.isArray(fileConfig.admin_role_ids) ? fileConfig.admin_role_ids.map(String) : []);
+
+export const config = Object.freeze({
+  token_env: first(process.env.TOKEN_ENV, fileConfig.token_env, 'DISCORD_TOKEN'),
+  api_base: trim(first(process.env.API_BASE, process.env.BACKEND_URL, fileConfig.api_base, 'https://api.sv13tcg.com')),
+
+  // Private storage contract: ENV only. Never source the storage key from committed config.
+  persistent_data_url: trim(process.env.PERSISTENT_DATA_URL || ''),
+  storage_key: String(process.env.STORAGE_KEY || ''),
+  bot_api_key: String(process.env.BOT_API_KEY || process.env.X_BOT_KEY || process.env.BOT_KEY || ''),
+  debug_key: String(process.env.DEBUG_KEY || ''),
+  internal_backend_url: trim(process.env.INTERNAL_BACKEND_URL || ''),
+
+  admin_api_key: process.env.ADMIN_API_KEY || '',
+  admin_payout_channel_id: first(process.env.ADMIN_PAYOUT_CHANNEL_ID, fileConfig.admin_payout_channel_id, ''),
+  admin_role_ids: configuredAdminRoles,
+  adminIds: process.env.ADMIN_IDS ? csv(process.env.ADMIN_IDS) : (Array.isArray(fileConfig.adminIds) ? fileConfig.adminIds.map(String) : []),
+  battlefield_channel_id: first(process.env.BATTLEFIELD_CHANNEL_ID, fileConfig.battlefield_channel_id, ''),
+  economy_channel_id: first(process.env.ECONOMY_CHANNEL_ID, fileConfig.economy_channel_id, ''),
+  founder_role_id: first(process.env.FOUNDER_ROLE_ID, fileConfig.founder_role_id, ''),
+  manage_cards_channel_id: first(process.env.MANAGE_CARDS_CHANNEL_ID, fileConfig.manage_cards_channel_id, ''),
+  manage_deck_channel_id: first(process.env.MANAGE_DECK_CHANNEL_ID, fileConfig.manage_deck_channel_id, ''),
+
   linked_decks_file: './data/linked_decks.json',
-  duel_summary_file: './public/data/duel_summary.json',
+  duel_summary_file: './data/summaries',
+  files: Object.freeze({
+    linked_decks: PATH_CONFIG.linkedDecks,
+    wallet: PATH_CONFIG.wallet,
+    player_data: PATH_CONFIG.playerData,
+    trade_queue: PATH_CONFIG.tradeQueue,
+    duel_summaries_dir: `${PATH_CONFIG.summariesDir}/`,
+    trades: PATH_CONFIG.trades,
+    trade_limits: PATH_CONFIG.tradeLimits,
+    master_cards: PATH_CONFIG.masterCardsLocal,
+    reveal_dir: `${PATH_CONFIG.packRevealsDir}/`,
+  }),
 
-  // 🌐 UI URLs (kept)
-  ui_urls: {
-    hub_ui: process.env.HUB_UI || 'https://madv313.github.io/HUB-UI/',
-    card_collection_ui: process.env.CARD_COLLECTION_UI || 'https://madv313.github.io/Card-Collection-UI/',
-    pack_reveal_ui: process.env.PACK_REVEAL_UI || 'https://madv313.github.io/Pack-Reveal-UI/',
-    deck_builder_ui: process.env.DECK_BUILDER_UI || 'https://madv313.github.io/Deck-Builder-UI/',
-    stats_leaderboard_ui: process.env.STATS_LEADERBOARD_UI || 'https://madv313.github.io/Stats-Leaderboard-UI/',
-    duel_summary_ui: process.env.DUEL_SUMMARY_UI || 'https://madv313.github.io/Duel-Summary-UI/',
-    spectator_view_ui: process.env.SPECTATOR_VIEW_UI || 'https://madv313.github.io/Spectator-View-UI/',
-    duel_ui: process.env.DUEL_UI || 'https://madv313.github.io/Duel-UI/',
-  },
+  ui_urls: Object.freeze({
+    hub_ui: UI.hub,
+    card_collection_ui: UI.collection,
+    pack_reveal_ui: UI.packReveal,
+    deck_builder_ui: UI.deckBuilder,
+    stats_leaderboard_ui: UI.leaderboard,
+    player_stats_ui: UI.stats,
+    leaderboard_ui: UI.leaderboard,
+    duel_summary_ui: UI.duelSummary,
+    spectator_view_ui: UI.spectator,
+    duel_ui: UI.duel,
+    rulebook_ui: UI.rules,
+  }),
 
-  // 💰 Coin system logic (kept)
-  coin_system: {
-    card_pack_cost: toNum(process.env.CARD_PACK_COST, 3),
-    card_sell_values: {
-      common: toNum(process.env.SELL_VALUE_COMMON, 0.5),
-      uncommon: toNum(process.env.SELL_VALUE_UNCOMMON, 1),
-      rare: toNum(process.env.SELL_VALUE_RARE, 2),
-      legendary: toNum(process.env.SELL_VALUE_LEGENDARY, 3),
-    },
-    buy_limit_per_day: toInt(process.env.BUY_LIMIT_PER_DAY, 5),
-    sell_limit_per_day: toInt(process.env.SELL_LIMIT_PER_DAY, 5),
-    max_card_collection_size: toInt(process.env.MAX_COLLECTION_SIZE, 250),
-    rarity_weights: {
-      common: toInt(process.env.WEIGHT_COMMON, 5),
-      uncommon: toInt(process.env.WEIGHT_UNCOMMON, 3),
-      rare: toInt(process.env.WEIGHT_RARE, 2),
-      legendary: toInt(process.env.WEIGHT_LEGENDARY, 1),
-    },
-    buycard_message:
-      process.env.BUYCARD_MESSAGE ||
-      'Your new card pack is ready! View it here: https://madv313.github.io/Pack-Reveal-UI/',
-  },
+  image_base: trim(first(process.env.IMAGE_BASE, fileConfig.image_base, 'https://sv13tcg.com/assets/cards')),
+  image_base_fallbacks: process.env.IMAGE_BASE_FALLBACKS
+    ? csv(process.env.IMAGE_BASE_FALLBACKS)
+    : (Array.isArray(fileConfig.image_base_fallbacks) ? fileConfig.image_base_fallbacks.map(trim).filter(Boolean) : []),
+  card_back_filename: first(process.env.CARD_BACK_FILENAME, fileConfig.card_back_filename, '000_CardBack_Unique.png'),
 
-  // ───────────────────────────────
-  // NEW: persistent storage + API base
-  // ───────────────────────────────
+  coin_system: Object.freeze({
+    card_pack_cost: num(first(process.env.CARD_PACK_COST, fileCoin.card_pack_cost), 3),
+    cards_per_pack: int(first(process.env.CARDS_PER_PACK, fileCoin.cards_per_pack), 3),
+    buy_limit_per_day: int(first(process.env.BUY_LIMIT_PER_DAY, fileCoin.buy_limit_per_day), 5),
+    sell_limit_per_day: int(first(process.env.SELL_LIMIT_PER_DAY, fileCoin.sell_limit_per_day), 5),
+    max_card_collection_size: int(first(process.env.MAX_COLLECTION_SIZE, fileCoin.max_card_collection_size), 250),
+    card_sell_values: sellValues,
+    card_sell_values_legacy: Object.freeze({ common: sellValues.Common, uncommon: sellValues.Uncommon, rare: sellValues.Rare, legendary: sellValues.Legendary }),
+    rarity_weights: rarityWeightsMap,
+    buycard_message: first(process.env.BUYCARD_MESSAGE, fileCoin.buycard_message, 'Your new card pack is ready!'),
+  }),
 
-  // If you are using a remote persistent repo or object store, set these:
-  // e.g. STORAGE_BASE=https://raw.githubusercontent.com/org/persistent-data/main/
-  storage_base: ensureTrailingSlash(process.env.STORAGE_BASE || process.env.PERSISTENT_BASE || ''), // remote read root
-  storage_write_api: trimTrailingSlash(process.env.STORAGE_WRITE_API || process.env.PERSISTENT_WRITE_API || ''), // write endpoint (if any)
-  storage_bucket: process.env.STORAGE_BUCKET || '',       // optional provider bucket/id
-  storage_prefix: ensureTrailingSlash(process.env.STORAGE_PREFIX || ''), // e.g., "sv13/"
-  storage_read_timeout_ms: toInt(process.env.STORAGE_READ_TIMEOUT_MS, 8000),
+  trade: Object.freeze({
+    daily_initiation_limit: int(first(process.env.TRADE_LIMIT_PER_DAY, fileTrade.daily_initiation_limit, fileTrade.trade_limit_per_day), 3),
+    ttl_hours: int(first(process.env.TRADE_TTL_HOURS, fileTrade.ttl_hours, fileTrade.session_ttl_hours), 24),
+    max_cards_per_side: int(first(process.env.TRADE_MAX_CARDS_PER_SIDE, fileTrade.max_cards_per_side), 3),
+  }),
+  trade_system: Object.freeze({
+    daily_initiation_limit: int(first(process.env.TRADE_LIMIT_PER_DAY, fileTrade.daily_initiation_limit, fileTrade.trade_limit_per_day), 3),
+    trade_limit_per_day: int(first(process.env.TRADE_LIMIT_PER_DAY, fileTrade.daily_initiation_limit, fileTrade.trade_limit_per_day), 3),
+    sell_limit_per_day: int(first(process.env.SELL_LIMIT_PER_DAY, fileCoin.sell_limit_per_day), 5),
+    ttl_hours: int(first(process.env.TRADE_TTL_HOURS, fileTrade.ttl_hours, fileTrade.session_ttl_hours), 24),
+    max_cards_per_side: int(first(process.env.TRADE_MAX_CARDS_PER_SIDE, fileTrade.max_cards_per_side), 3),
+  }),
 
-  // Common file keys used by storageClient:
-  files: {
-    linked_decks: process.env.FILE_LINKED_DECKS || 'data/linked_decks.json',
-    wallet: process.env.FILE_WALLET || 'data/coin_bank.json',
-    player_data: process.env.FILE_PLAYER_DATA || 'data/player_data.json',
-    trade_queue: process.env.FILE_TRADE_QUEUE || 'data/tradeQueue.json',
-    duel_stats: process.env.FILE_DUEL_STATS || 'data/duelStats.json',
-    duel_summaries_dir: process.env.FILE_DUEL_SUMMARIES_DIR || 'data/summaries/',
-    trades: process.env.FILE_TRADES || 'data/trades.json',
-    trade_limits: process.env.FILE_TRADE_LIMITS || 'data/trade_limits.json',
-    master_cards: process.env.FILE_MASTER_CARDS || 'logic/CoreMasterReference.json',
-    reveal_dir: process.env.FILE_REVEAL_DIR || 'public/data/', // where reveal_<token>.json lives
-  },
+  duel: Object.freeze({
+    starting_hp: int(first(process.env.DUEL_STARTING_HP, fileDuel.starting_hp), 200),
+    deck_min: int(first(process.env.DECK_MIN_SIZE, fileConfig.deck_rules?.min_cards), 20),
+    deck_max: int(first(process.env.DECK_MAX_SIZE, fileConfig.deck_rules?.max_cards), 40),
+    max_copies: int(first(process.env.DECK_MAX_COPIES, fileConfig.deck_rules?.max_copies), 5),
+    opening_hand: int(first(process.env.DUEL_OPENING_HAND, fileDuel.opening_hand), 3),
+    hand_limit: int(first(process.env.DUEL_HAND_LIMIT, fileDuel.hand_limit), 4),
+    field_limit: int(first(process.env.DUEL_FIELD_LIMIT, fileDuel.field_limit), 4),
+    practice_counts_competitive: bool(first(process.env.PRACTICE_COUNTS_COMPETITIVE, fileDuel.practice_counts_competitive), false),
+  }),
 
-  // For routes/utilities that need a backend base (trade, etc.)
-  api_base: trimTrailingSlash(
-    process.env.API_BASE ||
-    process.env.api_base ||
-    process.env.BACKEND_URL ||
-    ''
-  ),
+  pass_api_query: bool(first(process.env.PASS_API_QUERY, fileConfig.pass_api_query, fileMigration.pass_api_query), false),
+  cors_allow_legacy_github: bool(first(process.env.CORS_ALLOW_LEGACY_GITHUB, fileMigration.legacy_github_cors_temporary), true),
+  cors_extra_origins: csv(process.env.CORS_EXTRA_ORIGINS || ''),
+  debug_mode: bool(process.env.DEBUG_MODE, false),
 
-  // 👉 NEW: base for /me/:token/* endpoints (persistent-data service)
-  // Set ME_BASE (or me_base / PERSISTENT_DATA_BASE) to e.g.:
-  //   https://sv13-tcg-data-production.up.railway.app
-  me_base: trimTrailingSlash(
-    process.env.ME_BASE ||
-    process.env.me_base ||
-    process.env.PERSISTENT_DATA_BASE ||
-    ''
-  ),
+  storage_read_timeout_ms: int(process.env.STORAGE_TIMEOUT_MS, 12000),
+});
 
-  // Optional absolute base for card images (front-end CDN/public)
-  image_base:
-    trimTrailingSlash(process.env.IMAGE_BASE || process.env.image_base || 'https://madv313.github.io/Card-Collection-UI/images/cards'),
-
-  // 👉 NEW (non-breaking): optional fallbacks for image hosting
-  image_base_fallbacks: [
-    trimTrailingSlash(process.env.IMAGE_BASE_FALLBACK_1 || 'https://raw.githubusercontent.com/MadV313/Duel-Bot/main/images/cards'),
-    trimTrailingSlash(process.env.IMAGE_BASE_FALLBACK_2 || '')
-  ].filter(Boolean),
-
-  // 👉 NEW (non-breaking): standard card back filename (used by UIs/DMs if desired)
-  card_back_filename: process.env.CARD_BACK_FILENAME || '000_CardBack_Unique.png',
-
-  // Convenience flags
-  debug_mode: String(process.env.DEBUG_MODE || 'false').toLowerCase() === 'true',
-};
-
-// ───────────────────────────────
-// Helper getters (non-breaking)
-// ───────────────────────────────
-
-/** Absolute URL for reading from persistent storage (if configured) */
-export function storageReadUrl(relPath) {
-  if (!config.storage_base) return '';
-  const clean = String(relPath || '').replace(/^\/+/, '');
-  return config.storage_base + (config.storage_prefix ? config.storage_prefix : '') + clean;
-}
-
-/** A canonical path to CoreMasterReference for loaders that accept local or remote. */
-export const cardDataPath =
-  process.env.CARD_DATA_PATH ||
-  config.files.master_cards ||
-  './logic/CoreMasterReference.json';
-
-/** Normalized rarity weight map in TitleCase keys for internal logic. */
-export const rarityWeights = {
-  Common: config.coin_system.rarity_weights.common,
-  Uncommon: config.coin_system.rarity_weights.uncommon,
-  Rare: config.coin_system.rarity_weights.rare,
-  Legendary: config.coin_system.rarity_weights.legendary,
-};
-
-/** Convenience passthroughs used around the codebase (stays stable). */
+export const cardDataPath = first(process.env.CARD_DATA_PATH, PATH_CONFIG.masterCardsLocal);
+export const rarityWeights = rarityWeightsMap;
 export const api_base = config.api_base;
-export const me_base = config.me_base;              // ← NEW export
 export const image_base = config.image_base;
 export const image_base_fallbacks = config.image_base_fallbacks;
 export const card_back_filename = config.card_back_filename;
 
-/** UI helpers (returns trimmed, with trailing slash) */
-export const UI = {
-  hub: ensureTrailingSlash(config.ui_urls.hub_ui),
-  collection: ensureTrailingSlash(config.ui_urls.card_collection_ui),
-  packReveal: ensureTrailingSlash(config.ui_urls.pack_reveal_ui),
-  deckBuilder: ensureTrailingSlash(config.ui_urls.deck_builder_ui),
-  stats: ensureTrailingSlash(config.ui_urls.stats_leaderboard_ui),
-  duelSummary: ensureTrailingSlash(config.ui_urls.duel_summary_ui),
-  spectator: ensureTrailingSlash(config.ui_urls.spectator_view_ui),
-  duel: ensureTrailingSlash(config.ui_urls.duel_ui),
-};
+export function storageReadUrl(relPath) {
+  if (!config.persistent_data_url) return '';
+  return `${config.persistent_data_url}/${String(relPath || '').replace(/^\/+/, '')}`;
+}

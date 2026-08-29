@@ -1,197 +1,141 @@
-// utils/deckUtils.js
-// Utilities that operate on ID-keyed linked_decks.json and related data files.
-// Provides token → userId resolution, master list loading,
-// and both map- and array-shaped collection helpers (compat).
-//
-// 🔁 Updated for persistent storage via storageClient:
-// - All file reads now go through storageClient.load_file(relPath)
-// - Paths are taken from utils/config.js -> config.files.*
-// - Adds robust JSON parsing + fallbacks with [STORAGE] debug logs
-//
-// Existing public API (function names/shapes) is UNCHANGED.
-
+import fs from 'fs/promises';
 import path from 'path';
-import { config } from './config.js';
-import * as storageClient from './storageClient.js'; // expects async load_file/save_file
+import { PATHS, loadJSON } from './storageClient.js';
+import { config, cardDataPath } from './config.js';
 
-// Resolve repo-relative defaults as a last resort (should NOT generally be used)
-const legacyDefaults = {
-  linked_decks: path.resolve('./data/linked_decks.json'),
-  player_data:  path.resolve('./data/player_data.json'),
-  coin_bank:    path.resolve('./data/coin_bank.json'),
-  master_cards: path.resolve('./logic/CoreMasterReference.json'),
-};
-
-const files = {
-  linked_decks: config?.files?.linked_decks || 'data/linked_decks.json',
-  player_data:  config?.files?.player_data  || 'data/player_data.json',
-  coin_bank:    config?.files?.wallet       || 'data/coin_bank.json',
-  master_cards: config?.files?.master_cards || 'logic/CoreMasterReference.json',
-};
-
-export function pad3(n) {
-  return String(n).padStart(3, '0');
+export function pad3(value) {
+  const n = String(value ?? '').trim();
+  if (!/^\d+$/.test(n)) return n.padStart(3, '0');
+  return n.padStart(3, '0').slice(-3);
 }
 
-/** Internal: robust JSON loader via storageClient with fallback & debug logs */
-async function readJson(relPath, fallback = {}) {
-  const rel = String(relPath || '').replace(/^\/+/, '');
-  try {
-    const raw = await storageClient.load_file(rel);
-    if (raw == null) {
-      console.warn(`[STORAGE] ${rel} returned null/undefined; using fallback.`);
-      return fallback;
-    }
-    // raw may be Buffer | string | object depending on client; normalize
-    let txt;
-    if (typeof raw === 'string') txt = raw;
-    else if (Buffer.isBuffer(raw)) txt = raw.toString('utf-8');
-    else if (typeof raw === 'object') {
-      // Some storage adapters may already hand back parsed JSON
-      return raw;
-    } else {
-      console.warn(`[STORAGE] ${rel} unsupported payload type ${typeof raw}; using fallback.`);
-      return fallback;
-    }
-
-    try {
-      const parsed = JSON.parse(txt);
-      console.log(`[STORAGE] Loaded ${rel} successfully.`);
-      return parsed;
-    } catch (e) {
-      console.error(`[STORAGE] JSON parse failed for ${rel}: ${e?.message}`);
-      return fallback;
-    }
-  } catch (err) {
-    console.error(`[STORAGE] load_file error for ${rel}:`, err?.message || err);
-    // Legacy local fallback (best-effort only; avoid in production)
-    try {
-      const { readFile } = await import('fs/promises');
-      const p = legacyDefaults[
-        Object.entries(files).find(([, v]) => v === rel)?.[0] || ''
-      ] || rel;
-      const txt = await readFile(p, 'utf-8');
-      const parsed = JSON.parse(txt);
-      console.warn(`[STORAGE] Fallback read succeeded for ${rel} → ${p}`);
-      return parsed;
-    } catch {
-      return fallback;
-    }
-  }
+export function normalizeRarity(value) {
+  const s = String(value || 'Common').trim().toLowerCase();
+  return ({ common: 'Common', uncommon: 'Uncommon', rare: 'Rare', legendary: 'Legendary', unique: 'Unique' })[s] || (s ? s[0].toUpperCase() + s.slice(1) : 'Common');
 }
 
-/* -----------------------------------------------------------------------------
- * Public API
- * -------------------------------------------------------------------------- */
-
-/**
- * Loads the full map of linked decks keyed by userId.
- * {
- *   "1234567890": {
- *     discordName: "Miles",
- *     deck: [],
- *     collection: { "001": 2, "002": 1, ... },
- *     token: "abc...",
- *     createdAt: "...",
- *     lastLinkedAt: "..."
- *   }
- * }
- */
 export async function loadLinkedDecks() {
-  const data = await readJson(files.linked_decks, {});
-  // Ensure an object map
-  return (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+  const data = await loadJSON(PATHS.linkedDecks);
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
 }
 
-/**
- * Returns userId for a given token or null if not found.
- */
 export async function resolveUserIdByToken(token) {
   if (!token) return null;
   const linked = await loadLinkedDecks();
   for (const [userId, profile] of Object.entries(linked)) {
-    if (profile && profile.token === token) return userId;
+    if (profile && String(profile.token || '') === String(token)) return String(userId);
   }
   return null;
 }
 
-/**
- * Returns the full player profile by userId, or null if missing.
- */
 export async function getPlayerProfileByUserId(userId) {
   const linked = await loadLinkedDecks();
-  return linked[userId] || null;
+  return linked[String(userId)] || null;
 }
 
-/**
- * Returns a simple { "001": 2, "002": 0, ... } map for the player's collection.
- * Guarantees 3-digit keys, excludes invalid entries, keeps raw counts as-is.
- */
 export async function getPlayerCollectionMap(userId) {
   const profile = await getPlayerProfileByUserId(userId);
-  const map = {};
-  if (!profile || !profile.collection || typeof profile.collection !== 'object') {
-    return map;
+  const out = {};
+  if (!profile?.collection || typeof profile.collection !== 'object' || Array.isArray(profile.collection)) return out;
+  for (const [rawId, rawQty] of Object.entries(profile.collection)) {
+    const id = pad3(rawId);
+    const qty = Math.max(0, Math.floor(Number(rawQty) || 0));
+    if (/^\d{3}$/.test(id)) out[id] = qty;
   }
-  for (const [k, v] of Object.entries(profile.collection)) {
-    const id = pad3(k);
-    const count = Number(v) || 0;
-    if (!Number.isFinite(count) || id === 'NaN') continue;
-    map[id] = count;
-  }
-  return map;
+  return out;
 }
 
-/**
- * ⚠️ COMPAT: Older routes import { getPlayerCollection } expecting an ARRAY like:
- *   [{ number: "001", owned: 2 }, ...] sorted ascending, excluding "000".
- * This wrapper converts the map shape to the legacy array shape.
- */
 export async function getPlayerCollection(userId) {
   const map = await getPlayerCollectionMap(userId);
   return Object.entries(map)
     .filter(([id]) => id !== '000')
-    .map(([number, owned]) => ({ number, owned: Number(owned) || 0 }))
-    .sort((a, b) => parseInt(a.number, 10) - parseInt(b.number, 10));
+    .map(([number, owned]) => ({ number, owned }))
+    .sort((a, b) => Number(a.number) - Number(b.number));
 }
 
-/**
- * Loads master card list from logic/CoreMasterReference.json and normalizes entries.
- * Ensures array of objects with fields: { card_id, name, rarity, type, image }
- * Skips #000 in callers.
- */
-export async function loadMaster() {
-  const raw = await readJson(files.master_cards, []);
-  const arr = Array.isArray(raw) ? raw : (raw.cards || []);
-  // Normalize: card_id must be 3-digit string
-  return arr.map(c => {
-    const id3 = pad3(c.card_id ?? c.number ?? c.id ?? '');
-    const safe = (s, fallback) => String(s || fallback).replace(/[^a-zA-Z0-9._-]/g, '');
-    return {
-      card_id: id3,
-      name: c.name ?? `Card ${id3}`,
-      rarity: c.rarity ?? 'Common',
-      type: c.type ?? 'Unknown',
-      image:
-        c.image ??
-        c.filename ??
-        `${id3}_${safe(c.name, 'Card')}_${safe(c.type, 'Unknown')}.png`,
-    };
-  });
+let masterCache = null;
+export async function loadMaster({ refresh = false } = {}) {
+  if (masterCache && !refresh) return masterCache;
+  const absolute = path.resolve(cardDataPath);
+  const raw = JSON.parse(await fs.readFile(absolute, 'utf8'));
+  const cards = Array.isArray(raw) ? raw : Array.isArray(raw.cards) ? raw.cards : [];
+  masterCache = cards.map(card => ({
+    ...card,
+    card_id: pad3(card.card_id ?? card.number ?? card.id ?? ''),
+    rarity: normalizeRarity(card.rarity),
+    image: card.image || card.filename || '',
+  }));
+  return masterCache;
 }
 
-/**
- * Returns { wins, losses, coins } for the user.
- */
 export async function getUserStats(userId) {
-  const [playerData, bank] = await Promise.all([
-    readJson(files.player_data, {}),
-    readJson(files.coin_bank, {})
+  const [playerData, bank, collection] = await Promise.all([
+    loadJSON(PATHS.playerData).catch(() => ({})),
+    loadJSON(PATHS.wallet).catch(() => ({})),
+    getPlayerCollectionMap(userId),
   ]);
+  const row = playerData?.[String(userId)] || {};
+  const cardsCollected = Object.entries(collection).filter(([id, qty]) => id !== '000' && qty > 0).length;
+  const cardsOwned = Object.entries(collection).reduce((sum, [id, qty]) => sum + (id === '000' ? 0 : qty), 0);
+  return {
+    discordName: (await getPlayerProfileByUserId(userId))?.discordName || '',
+    wins: Number(row.wins || 0),
+    losses: Number(row.losses || 0),
+    coins: Number(bank?.[String(userId)] || 0),
+    cardsCollected,
+    cardsOwned,
+    practiceWins: Number(row.practiceWins || 0),
+    practiceLosses: Number(row.practiceLosses || 0),
+  };
+}
 
-  const wins = Number(playerData?.[userId]?.wins ?? 0) || 0;
-  const losses = Number(playerData?.[userId]?.losses ?? 0) || 0;
-  const coins = Number(bank?.[userId] ?? 0) || 0;
+export function normalizeDeck(deck) {
+  // Preserve the modern schema. Convert legacy arrays only as a compatibility adapter.
+  const name = String(deck?.name || 'My Deck').slice(0, 80);
+  let cards = [];
+  if (Array.isArray(deck)) {
+    const counts = new Map();
+    for (const raw of deck) {
+      const id = pad3(typeof raw === 'object' ? raw?.id ?? raw?.card_id : raw);
+      if (/^\d{3}$/.test(id)) counts.set(id, (counts.get(id) || 0) + 1);
+    }
+    cards = [...counts].map(([id, qty]) => ({ id, qty }));
+  } else if (Array.isArray(deck?.cards)) {
+    cards = deck.cards.map(row => ({ id: pad3(row?.id ?? row?.card_id), qty: Math.max(0, Math.floor(Number(row?.qty) || 0)) }));
+  }
+  cards = cards.filter(row => /^\d{3}$/.test(row.id) && row.qty > 0);
+  // Canonicalize duplicate rows before validation/persistence. Without this, a client
+  // could split one card across several rows to bypass max-copy and ownership checks.
+  const combined = new Map();
+  for (const row of cards) combined.set(row.id, (combined.get(row.id) || 0) + row.qty);
+  return { name, cards: [...combined].map(([id, qty]) => ({ id, qty })) };
+}
 
-  return { wins, losses, coins };
+export function deckCount(deck) {
+  return normalizeDeck(deck).cards.reduce((sum, row) => sum + row.qty, 0);
+}
+
+export function validateDeck(deck, collection = {}) {
+  const normalized = normalizeDeck(deck);
+  const errors = [];
+  const total = deckCount(normalized);
+  if (total < config.duel.deck_min || total > config.duel.deck_max) errors.push(`Deck must contain ${config.duel.deck_min}-${config.duel.deck_max} cards.`);
+  for (const row of normalized.cards) {
+    if (row.id === '000') errors.push('Card 000 cannot be placed in a playable deck.');
+    if (row.qty > config.duel.max_copies) errors.push(`${row.id} exceeds the ${config.duel.max_copies}-copy limit.`);
+    if (row.qty > Number(collection[row.id] || 0)) errors.push(`${row.id} exceeds owned quantity.`);
+  }
+  return { ok: errors.length === 0, errors, deck: normalized, total };
+}
+
+export async function validateSavedDeckForUser(userId) {
+  const profile = await getPlayerProfileByUserId(userId);
+  if (!profile) return { ok: false, errors: ['Player is not linked.'], deck: { name: 'My Deck', cards: [] }, total: 0 };
+  return validateDeck(profile.deck, profile.collection || {});
+}
+
+export function expandDeck(deck) {
+  const out = [];
+  for (const { id, qty } of normalizeDeck(deck).cards) for (let i = 0; i < qty; i++) out.push(id);
+  return out;
 }
