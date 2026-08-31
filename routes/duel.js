@@ -3,7 +3,8 @@ import { getSpectatorCount } from '../logic/chatRegistry.js';
 import { PlayerLinks } from '../utils/playerLinks.js';
 import { getPlayerProfileByUserId, resolveUserIdByToken } from '../utils/deckUtils.js';
 import { applyAction, applyBotTurn, applyTrustedSnapshot } from '../logic/duelActions.js';
-import { createChallengeSession, createPracticeSession, decideChallenge, finalizeSession, getSession, listSessions, resolveSeat, serializePlayer, serializeSpectator } from '../logic/duelSessions.js';
+import { redactConcealedField } from '../logic/duelEffects.js';
+import { createChallengeSession, createPracticeSession, decideChallenge, finalizeSession, getSession, listSessions, serializePlayer, serializeSpectator } from '../logic/duelSessions.js';
 
 const router = express.Router();
 export const botAlias = express.Router();
@@ -12,7 +13,23 @@ const keyFrom = req => String(req.get('X-Bot-Key') || req.get('Authorization')?.
 const protectedBot = (req,res,next) => { const expected=botKey(); if (!expected) return res.status(503).json({error:'BOT_API_KEY is not configured'}); if (keyFrom(req)!==expected) return res.status(401).json({error:'Unauthorized'}); next(); };
 const sendError = (res,e) => res.status(e?.status || 500).json({ error: e?.message || 'Internal error' });
 
-router.get('/status', (_req,res) => res.json({ ok:true, engine:'DuelSession', version:1 }));
+// Concealed traps must remain visually AND structurally concealed from the other
+// player and spectators. The canonical session retains the real card IDs server-side.
+async function redactPlayerView(view) {
+  if (!view || !['player1','player2'].includes(view.seat)) return view;
+  const remote = view.seat === 'player1' ? 'player2' : 'player1';
+  return { ...view, [remote]: { ...view[remote], field: await redactConcealedField(view[remote]?.field) } };
+}
+async function redactSpectatorView(view) {
+  if (!view) return view;
+  return {
+    ...view,
+    player1: { ...view.player1, field: await redactConcealedField(view.player1?.field) },
+    player2: { ...view.player2, field: await redactConcealedField(view.player2?.field) },
+  };
+}
+
+router.get('/status', (_req,res) => res.json({ ok:true, engine:'DuelSession', version:2 }));
 
 async function practiceHandler(req,res) {
   try {
@@ -57,21 +74,21 @@ router.get('/:session/state', async (req,res) => {
     const token=String(req.query?.token||req.get('X-Player-Token')||'');
     const view=serializePlayer(s,token,getSpectatorCount(s.id));
     if(!view) return res.status(401).json({error:'Invalid player token'});
-    res.set('Cache-Control','no-store').json(view);
+    res.set('Cache-Control','no-store').json(await redactPlayerView(view));
   } catch(e){ sendError(res,e); }
 });
 
 router.get('/:session/spectator', async (req,res) => {
-  try { const s=await getSession(req.params.session); if(!s) return res.status(404).json({error:'Session not found'}); res.set('Cache-Control','no-store').json(serializeSpectator(s,getSpectatorCount(s.id))); }
+  try { const s=await getSession(req.params.session); if(!s) return res.status(404).json({error:'Session not found'}); res.set('Cache-Control','no-store').json(await redactSpectatorView(serializeSpectator(s,getSpectatorCount(s.id)))); }
   catch(e){ sendError(res,e); }
 });
 
 router.post('/:session/action', async (req,res) => {
-  try { const result=await applyAction(req.params.session,String(req.body?.token||''),req.body?.action,req.body?.parameters||{}); res.json({ok:true,revision:result.session.revision,state:result.view}); }
+  try { const result=await applyAction(req.params.session,String(req.body?.token||''),req.body?.action,req.body?.parameters||{}); res.json({ok:true,revision:result.session.revision,state:await redactPlayerView(result.view)}); }
   catch(e){ sendError(res,e); }
 });
 router.post('/:session/bot-turn', async (req,res) => {
-  try { const s=await applyBotTurn(req.params.session,String(req.body?.token||'')); res.json({ok:true,revision:s.revision,state:serializePlayer(s,String(req.body?.token||''),getSpectatorCount(s.id))}); }
+  try { const s=await applyBotTurn(req.params.session,String(req.body?.token||'')); res.json({ok:true,revision:s.revision,state:await redactPlayerView(serializePlayer(s,String(req.body?.token||''),getSpectatorCount(s.id)))}); }
   catch(e){ sendError(res,e); }
 });
 
@@ -90,12 +107,12 @@ router.get('/state', async (req,res) => {
     const id=String(req.query?.session||''); if(!id) return res.status(400).json({error:'session is required'});
     const s=await getSession(id); if(!s) return res.status(404).json({error:'Session not found'});
     const token=String(req.query?.token||req.get('X-Player-Token')||'');
-    if (token) { const view=serializePlayer(s,token,getSpectatorCount(id)); if(!view)return res.status(401).json({error:'Invalid player token'}); return res.json(view); }
-    return res.json(serializeSpectator(s,getSpectatorCount(id)));
+    if (token) { const view=serializePlayer(s,token,getSpectatorCount(id)); if(!view)return res.status(401).json({error:'Invalid player token'}); return res.json(await redactPlayerView(view)); }
+    return res.json(await redactSpectatorView(serializeSpectator(s,getSpectatorCount(id))));
   } catch(e){ sendError(res,e); }
 });
 router.get('/current', async (req,res) => {
-  try { const id=String(req.query?.session||''); if(!id) return res.status(400).json({error:'session is required'}); const s=await getSession(id); if(!s) return res.status(404).json({error:'Session not found'}); res.json(serializeSpectator(s,getSpectatorCount(id))); }
+  try { const id=String(req.query?.session||''); if(!id) return res.status(400).json({error:'session is required'}); const s=await getSession(id); if(!s) return res.status(404).json({error:'Session not found'}); res.json(await redactSpectatorView(serializeSpectator(s,getSpectatorCount(id)))); }
   catch(e){ sendError(res,e); }
 });
 
