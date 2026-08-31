@@ -1,0 +1,26 @@
+SV13 REPO 8 — DUEL-BOT CURRENT-BUILD REPAIR
+
+SOURCE BASELINE:
+Duel-Bot-main (1).zip
+SHA-256: becdf017aeaedbd391bf71a995c71dd8fa5b646f2908eb1dca5e4faee56003cc
+
+COPY THESE PATHS INTO THE CURRENT Duel-Bot REPO:
+  logic/duelEffects.js          NEW
+  logic/duelActions.js          REPLACE CURRENT
+  routes/duel.js                REPLACE CURRENT
+  test/duel-session-gameplay.test.js   NEW (validation only)
+
+NO OTHER CURRENT FILES NEED TO BE REPLACED FOR THIS PASS.
+
+VALIDATION COMPLETED:
+  npm test              -> 17/17 PASS
+  npm run check:active  -> 64 active files syntax PASS
+
+AFTER DEPLOYMENT:
+1. Confirm Railway deploy is healthy.
+2. Start a BRAND-NEW /practice duel.
+3. Confirm coin flip / opening auto-draw.
+4. Confirm a damage card actually changes HP.
+5. Confirm End Turn clears ephemeral cards and hands control to bot/human correctly.
+6. Confirm field is 3 slots and field-card removal works.
+7. Do not reuse the already-corrupted session from the failed test.
