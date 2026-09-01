@@ -7,6 +7,7 @@ import {
   runBotTurn,
   redactConcealedField,
   removeFieldCard,
+  resolveCombatExhaustion,
   startTurn,
 } from '../logic/duelEffects.js';
 
@@ -113,4 +114,90 @@ test('concealed trap IDs are redacted from remote/spectator payloads', async () 
   assert.deepEqual(redacted[0], { cardId:'000', isFaceDown:true, concealed:true });
   assert.equal(redacted[1].cardId, '031');
   assert.equal(redacted[2].cardId, '107');
+});
+
+
+test('combat exhaustion ends by remaining HP instead of endless turn passing', () => {
+  const s = session();
+  s.state.player1.hp = 112;
+  s.state.player2.hp = 74;
+  s.state.player1.hand = ['083']; // harmless loot remains
+  s.state.player2.hand = ['106']; // armed trap alone cannot fire without an attack/infected play
+  s.state.player2.field = [{ cardId:'107', isFaceDown:true, _fired:false }];
+  s.state.player1.deck = [];
+  s.state.player2.deck = [];
+
+  endTurnAndAdvance(s, 'player1');
+
+  assert.equal(s.status, 'finished');
+  assert.equal(s.winner, 'player1');
+  assert.equal(s.reason, 'combat_exhaustion');
+  assert.equal(s.state.player2.field[0].cardId, '107');
+});
+
+test('combat exhaustion is a draw when final HP is tied', () => {
+  const s = session();
+  s.state.player1.hp = 90;
+  s.state.player2.hp = 90;
+  s.state.player1.hand = ['083'];
+  s.state.player2.hand = ['084'];
+  s.state.player1.deck = [];
+  s.state.player2.deck = [];
+
+  assert.equal(resolveCombatExhaustion(s), true);
+  assert.equal(s.status, 'finished');
+  assert.equal(s.winner, null);
+  assert.equal(s.reason, 'combat_exhaustion');
+});
+
+test('offensive card or implemented weapon recovery prevents premature exhaustion', () => {
+  const attackReady = session();
+  attackReady.state.player1.deck = [];
+  attackReady.state.player2.deck = [];
+  attackReady.state.player1.hand = ['028'];
+  assert.equal(resolveCombatExhaustion(attackReady), false);
+  assert.equal(attackReady.status, 'live');
+
+  const recoverable = session();
+  recoverable.state.player1.deck = [];
+  recoverable.state.player2.deck = [];
+  recoverable.state.player1.hand = ['075']; // Weapon Cleaning Kit
+  recoverable.state.player1.discard = ['028'];
+  assert.equal(resolveCombatExhaustion(recoverable), false);
+  assert.equal(recoverable.status, 'live');
+});
+
+test('single empty player still loses when opponent retains real combat pressure', () => {
+  const s = session();
+  s.state.player1.hand = [];
+  s.state.player1.deck = [];
+  s.state.player2.hand = ['028'];
+  s.state.player2.deck = [];
+
+  startTurn(s, 'player1');
+
+  assert.equal(s.status, 'finished');
+  assert.equal(s.winner, 'player2');
+  assert.equal(s.reason, 'no_cards');
+});
+
+test('practice bot clears a full persistent field so it can keep playing instead of deadlocking', () => {
+  const s = session({ currentPlayer: 'player2' });
+  s.state.player2.field = [
+    { cardId:'031', isFaceDown:false, _fired:false },
+    { cardId:'034', isFaceDown:false, _fired:false },
+    { cardId:'106', isFaceDown:true, _fired:false },
+  ];
+  s.state.player2.hand = ['028'];
+  s.state.player2.deck = ['001'];
+  s.state.player1.hand = ['083'];
+  s.state.player1.deck = ['002'];
+
+  runBotTurn(s, 'player2');
+
+  assert.equal(s.state.player1.hp, 180);
+  assert.ok(s.state.player2.discard.includes('031'));
+  assert.ok(s.state.player2.discard.includes('028'));
+  assert.ok(s.state.events.some(e => e.type === 'bot_field_cleared'));
+  assert.equal(s.state.currentPlayer, 'player1');
 });
