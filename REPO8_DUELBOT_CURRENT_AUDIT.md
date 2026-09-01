@@ -1,119 +1,149 @@
-# SV13 Repo 8 — Duel-Bot current-build audit and repair
+# SV13 Repo 8 — Duel-Bot current-build audit / combat-exhaustion repair
 
 ## Source of truth
+
 This pass was re-based from the user-supplied current archive only:
 
-- Archive: `Duel-Bot-main (1).zip`
-- SHA-256: `becdf017aeaedbd391bf71a995c71dd8fa5b646f2908eb1dca5e4faee56003cc`
+- Archive: `Duel-Bot-main (2).zip`
+- SHA-256: `1c9272fc55edbff0166a5273ad17f8a20dbb0f28df710f4d12acf56994578334`
+- Audit date: 2026-08-31
 
-The previous Duel-Bot patch was treated only as a candidate implementation. Every runtime change below was checked against this uploaded build before inclusion.
+The existing Repo 8 DuelSession repair in this archive was retained. No older Duel-Bot copy was used as a replacement source.
 
-## Current-build findings
+## Current architecture confirmed and retained
 
-### Canonical session architecture is already present and should be retained
-The uploaded build already has the correct persistent per-session foundation in:
+The current build already contains the required server-owned DuelSession model and the previous gameplay migration:
 
-- `logic/duelSessions.js`
-- `routes/duel.js`
-- `utils/playerLinks.js`
-- `utils/storageClient.js`
+- `logic/duelSessions.js` owns unique practice/PvP sessions, token-hash seat resolution, revisions, summary finalization, and PvP stat finalization.
+- `logic/duelActions.js` accepts discrete authenticated actions (`start_turn`, `play_card`, `discard`, `remove_field_card`, `end_turn`, `forfeit`) and exposes a practice-only bot turn.
+- `routes/duel.js` exposes canonical session state/action endpoints and redacts concealed traps for remote players/spectators.
+- `server.js` mounts `/duel` and `/api/duel`, allows `https://duel.sv13tcg.com` in CORS, and does not require legacy `player1`, `player2`, `opponentToken`, or `role` query authorization.
+- `/practice` already supports the saved/random deck choice and creates a unique practice session.
+
+Those systems were not rewritten.
+
+## Reproduced remaining deadlock
+
+The current server could still produce the exact late-match loop observed in live practice:
+
+1. Both draw piles become empty.
+2. Remaining hands/fields can contain harmless Loot/Defense/traps but no attack/infected/direct-damage play.
+3. Face-down traps cannot fire because the current authoritative engine triggers them from attack/infected plays.
+4. Both sides can therefore keep ending turns indefinitely even though HP can no longer change.
+
+A second practice-only deadlock was also confirmed in `runBotTurn()`:
+
+- the bot can fill all three persistent field slots with Defense/traps;
+- with a full field, it cannot play the next card in hand;
+- unlike a human, it had no equivalent of the manual field-removal action;
+- this can prevent it from consuming the rest of its hand/deck indefinitely.
+
+## Repair implemented
+
+### Authoritative combat exhaustion — no discard reshuffle
+
+`logic/duelEffects.js` now settles a duel by remaining HP when:
+
+- both draw piles are empty; and
+- neither player has current/future combat pressure available to the authoritative engine.
+
+Combat pressure is conservatively retained when either side still has:
+
+- an Attack or Infected card in hand;
+- another non-trap card whose implemented metadata resolves direct HP pressure;
+- pending DOT damage; or
+- an implemented Weapon Cleaning Kit / Gun Cleaning Kit / tactical-recharge path that can recover an offensive card from discard.
+
+Armed traps alone do **not** keep the duel alive when neither player can make an attack/infected play.
+
+Outcome:
+
+- higher remaining HP wins;
+- equal HP produces a draw (`winner: null`);
+- reason is `combat_exhaustion` (or `cards_exhausted` when both hands are also empty).
+
+The pre-existing one-sided `no_cards` loss still applies when one player is completely empty **and the opponent still has real combat pressure**.
+
+The exhaustion check runs after end-of-turn field cleanup so ephemeral played cards reach discard before the terminal state/summary is finalized.
+
+### Practice bot full-field escape
+
+When the practice bot has all three persistent field slots occupied but still has a playable hand card, it now clears one of its own field cards to discard before making its normal one-card play. Fired traps are preferred for removal when present.
+
+This gives the bot the same basic escape path a human already has through `remove_field_card`, allowing its hand/deck to continue progressing instead of pass-looping forever.
+
+## Files changed in this pass
+
+Runtime:
+
+1. `logic/duelEffects.js` — updated combat-exhaustion resolution + bot full-field progression.
+
+Regression coverage:
+
+2. `test/duel-session-gameplay.test.js` — added exhaustion/HP-tiebreak/recovery/full-field bot tests.
+
+Documentation/manifest:
+
+3. `REPO8_DUELBOT_CURRENT_AUDIT.md` — this current-source audit.
+4. `PATCH_SHA256SUMS.txt` — checksums for the delivered patch files.
+
+No changes were required in:
+
 - `server.js`
+- `routes/duel.js`
+- `logic/duelActions.js`
+- `logic/duelSessions.js`
+- Discord cogs
+- storage/economy/trade/player-link code
+- environment/config files
 
-The canonical browser identity remains `session + token`; seat resolution stays server-side. `server.js` mounts `routes/duel.js` at `/duel` and `/api/duel`. These files/contracts were preserved rather than replacing the session model.
+## Validation
 
-### Confirmed gameplay regression
-The current `logic/duelActions.js` is transport/state-movement only:
+### Full automated suite
 
-- `play_card` removes an ID from hand and places it on field, but applies no card effect or HP change.
-- `applyBotTurn()` draws/places a card and changes turns, but applies no card effect or HP change.
-- `end_turn` only swaps players/increments turn; it does not perform the original Duel UI field cleanup or start-of-turn draw.
-- `start_turn` and `remove_field_card` are not implemented even though the repaired Duel UI uses those discrete actions.
+`npm test`:
 
-That exactly explains the observed test: the bot card appeared and its SFX played in the browser, but HP did not change and the turn loop became incomplete.
+- **22 / 22 tests passed**
+- 7 previously existing DuelSession gameplay tests retained
+- 5 new late-match/deadlock tests added
+- all recovery/storage/economy/session tests continue to pass
 
-### Existing legacy effect modules cannot safely be wired into DuelSession
-The upload still contains older global-state modules such as:
+New coverage verifies:
 
-- `logic/cardEffectHandler.js`
-- `logic/botHandler.js`
-- `logic/drawCard.js`
-- `logic/resolveComboEffects.js`
-- `logic/duelState.js`
-- legacy/unmounted duel route files
+- harmless cards + armed traps + empty decks end by HP instead of infinite turns;
+- equal final HP produces a draw;
+- a real attack in hand prevents premature exhaustion;
+- implemented weapon recovery from discard prevents premature exhaustion;
+- a completely empty player still loses if the opponent has real combat pressure;
+- a practice bot with a full persistent field clears a slot, plays, damages, discards cleanup cards, and returns control.
 
-They are based on the old global `duelState` model. `cardEffectHandler.js` also expects `logicActions[]`, while the current canonical `CoreMasterReference.json` uses `effect`, `logic_action`, `tags`, and `type`. Reconnecting those old modules would reintroduce the architecture Repo 8 is removing. They are therefore left untouched and unmounted.
+### Active production syntax scan
 
-## Repair strategy
-
-A new `logic/duelEffects.js` adapts the original Duel UI gameplay semantics to the existing current DuelSession state instead of resurrecting global browser authority.
-
-The session server now owns:
-
-- one-time/idempotent start-of-turn draw;
-- 3-card field limit matching the original UI;
-- hand discard;
-- local field-card removal to discard;
-- ephemeral field cleanup at end turn;
-- persistent Defense/trap retention;
-- fired-trap cleanup;
-- immediate damage/heal/draw/discard/steal families used by the original Duel UI resolver;
-- attack buffs and the original supported special effect families;
-- start-turn DOT/basic status ticks;
-- practice bot play + effect resolution + turn handoff;
-- winner detection and canonical finalization;
-- Combat Boots #034 Bear Trap/tripwire immunity;
-- concealed trap redaction for opponent/spectator payloads using the current canonical master, not a hard-coded public card ID leak.
-
-The browser still sends discrete actions only. The server remains authoritative.
-
-## Runtime files changed
-
-1. `logic/duelEffects.js` — **NEW**
-2. `logic/duelActions.js` — **UPDATED**
-3. `routes/duel.js` — **UPDATED**
-
-No changes were made to `server.js`, `logic/duelSessions.js`, storage, economy, trading, linking, pack purchase, collection, stats, environment variables, or persistence paths.
-
-## Validation performed against the uploaded current build
-
-### Full test suite
-`npm test` against the patched copy of the uploaded current repo:
-
-- **17/17 tests passed**
-- Includes all 10 existing recovery/contracts tests plus 7 new DuelSession gameplay tests.
-
-New gameplay coverage verifies:
-
-- Derringer #028 actually applies 20 HP damage.
-- Field remains capped at 3.
-- Field removal moves the card to discard.
-- End turn clears ephemeral field cards, preserves Defense, advances turn, and auto-draws once.
-- `start_turn` is idempotent/reconnect-safe.
-- Practice bot card effects change HP and return control.
-- Combat Boots #034 blocks Bear Trap/tripwire trap damage.
-- Face-down trap IDs are redacted from remote/spectator state.
-
-### Active-source syntax scan
 `npm run check:active`:
 
-- **64 active files passed syntax checks.**
+- **64 active files passed syntax validation.**
 
-### Direct syntax checks
-The three runtime repair files and new gameplay test pass `node --check`.
+Direct `node --check` also passes the modified runtime/test files.
 
-## Files deliberately NOT included
+### Full-repository legacy scan
 
-The delivery ZIP contains new/updated files only. It does **not** contain:
+A deliberately broader `node --check` of every `.js` file found two pre-existing syntax-invalid legacy files:
 
-- `.env` or any secrets;
-- persistent player/economy/trade data;
-- `server.js`;
-- `logic/duelSessions.js`;
-- current config/storage files;
-- legacy global duel modules;
-- unrelated cogs/routes.
+- `scripts/config.js`
+- `scripts/hubEnhancements.js`
 
-## Deployment/test note
-Apply the Duel-Bot files first, redeploy successfully, then test with a **brand-new `/practice` session**. Do not use the already-mutated practice session from the broken UI test as validation state.
+They are not part of the active backend source set, are not mounted/served by `server.js`, and are excluded by the repository's own `check:active` production scan. They were therefore left untouched in this Repo 8 gameplay repair rather than widening scope into obsolete UI-side scripts.
 
-This repair restores the original supported gameplay-loop/effect families under server authority. It is not a substitute for the planned separate 127-card effect-by-effect certification pass.
+## Deployment smoke test
+
+After applying this patch and redeploying Duel-Bot, use a brand-new `/practice` session and verify:
+
+1. normal attack damage / turn progression still works;
+2. bot can progress after filling all three persistent field slots;
+3. run a match until both decks are empty and neither side has an offensive/recoverable play;
+4. duel automatically finalizes at end-turn;
+5. higher HP player is declared winner (equal HP = draw);
+6. winner overlay/summary uses the same session ID and final HP;
+7. practice still does not change competitive PvP W/L.
+
+The planned 127-card effect-by-effect certification remains a separate pass after all repositories are stabilized.
