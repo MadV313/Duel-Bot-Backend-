@@ -451,6 +451,99 @@ function applyStartOfTurnBuffs(session, seat, index) {
   if (Number(p.buffs.blockHealTurns || 0) > 0) p.buffs.blockHealTurns = Number(p.buffs.blockHealTurns) - 1;
 }
 
+function effectText(meta) {
+  return `${txt(meta?.effect)} ${txt(meta?.logic_action)}`;
+}
+
+function canDirectlyPressureHp(meta) {
+  if (!meta) return false;
+  // Traps are reactive in the current authoritative engine. They do not create
+  // pressure by themselves when neither side can make an attack/infected play.
+  if (isTrapMeta(meta)) return false;
+  if (isType(meta, 'attack') || isType(meta, 'infected')) return true;
+  const text = effectText(meta);
+  if (/deal[s]?\s+\d+\s*dmg/.test(text)) return true;
+  if (/\d+\s*dmg\s+(?:for|over)\s+\d+\s*turn/.test(text)) return true;
+  if (/\b(?:drain|siphon)\b/.test(text)) return true;
+  if (/you\s+lose\s+\d+\s*hp.*enemy\s+gains\s+\d+/.test(text)) return true;
+  return false;
+}
+
+function canRecoverPressure(session, seat, index) {
+  const p = ensurePlayer(session, seat);
+  if (!p.discard.length || !p.hand.length) return false;
+
+  for (const handEntry of p.hand) {
+    const meta = findMeta(index, handEntry);
+    if (!meta) continue;
+    const text = effectText(meta);
+
+    if (/return.*gun.*discard.*draw\s+pile|refresh.*weapon.*discard/.test(text)) {
+      if (p.discard.some(entry => {
+        const discarded = findMeta(index, entry);
+        return discarded && (hasTag(discarded, 'gun') || isType(discarded, 'attack')) && canDirectlyPressureHp(discarded);
+      })) return true;
+    }
+
+    if (/recharge.*tactical.*discard/.test(text)) {
+      if (p.discard.some(entry => {
+        const discarded = findMeta(index, entry);
+        return discarded && isType(discarded, 'tactical') && canDirectlyPressureHp(discarded);
+      })) return true;
+    }
+  }
+  return false;
+}
+
+function hasPendingDamage(session, seat) {
+  const p = ensurePlayer(session, seat);
+  return Number(p.buffs?.dot?.turns || 0) > 0 && Number(p.buffs?.dot?.amount || 0) > 0;
+}
+
+function hasCombatPressure(session, seat, index) {
+  const p = ensurePlayer(session, seat);
+  if (hasPendingDamage(session, seat)) return true;
+  if (p.hand.some(entry => canDirectlyPressureHp(findMeta(index, entry)))) return true;
+  if (canRecoverPressure(session, seat, index)) return true;
+  return false;
+}
+
+function finishByHpComparison(session, reason) {
+  if (session.status !== 'live') return false;
+  const p1 = ensurePlayer(session, 'player1');
+  const p2 = ensurePlayer(session, 'player2');
+  const hp1 = Number(p1.hp || 0);
+  const hp2 = Number(p2.hp || 0);
+  session.status = 'finished';
+  session.finishedAt ||= now();
+  session.reason = reason;
+  session.winner = hp1 === hp2 ? null : (hp1 > hp2 ? 'player1' : 'player2');
+  event(session, 'duel_finished', { winner: session.winner, reason, finalHp: { player1: hp1, player2: hp2 } });
+  return true;
+}
+
+/**
+ * End a duel that can no longer make meaningful combat progress.
+ *
+ * We deliberately do NOT reshuffle discards. Once both draw piles are empty,
+ * the duel ends by remaining HP when neither player has an offensive card in
+ * hand (or a currently-implemented way to recover one from discard). Armed
+ * traps by themselves do not keep the duel alive because this engine only
+ * triggers them from attack/infected plays.
+ */
+export function resolveCombatExhaustion(session) {
+  if (!session || session.status !== 'live' || !session.state) return false;
+  const index = requireMaster();
+  const p1 = ensurePlayer(session, 'player1');
+  const p2 = ensurePlayer(session, 'player2');
+
+  if (p1.deck.length > 0 || p2.deck.length > 0) return false;
+  if (hasCombatPressure(session, 'player1', index) || hasCombatPressure(session, 'player2', index)) return false;
+
+  const completelyEmpty = p1.hand.length === 0 && p2.hand.length === 0;
+  return finishByHpComparison(session, completelyEmpty ? 'cards_exhausted' : 'combat_exhaustion');
+}
+
 export async function redactConcealedField(field) {
   const index = await getMasterIndex();
   return (Array.isArray(field) ? field : []).map(raw => {
@@ -468,6 +561,16 @@ export function startTurn(session, seat) {
   const marker = startMarker(session, seat);
   if (session.state.turnStarted === marker) return false;
 
+  // If neither side can create further combat pressure, settle the match by HP
+  // instead of letting harmless cards / armed traps bounce turns forever.
+  if (resolveCombatExhaustion(session)) {
+    session.state.turnStarted = marker;
+    return true;
+  }
+
+  // A single player who is completely out of cards still loses if the opponent
+  // retains real combat pressure. If both sides are exhausted, the HP tiebreak
+  // above wins instead of arbitrarily punishing whoever happened to be active.
   if (p.hand.length === 0 && p.deck.length === 0) {
     session.status = 'finished'; session.finishedAt = now(); session.winner = otherSeat(seat); session.reason = 'no_cards';
     event(session, 'duel_finished', { winner: session.winner, reason: session.reason });
@@ -535,6 +638,10 @@ export function endTurnAndAdvance(session, endingSeat) {
   cleanupField(session, endingSeat, index);
   if (session.status === 'finished') return;
 
+  // Run exhaustion after ephemeral cards have moved to discard so the terminal
+  // board is visually clean and the summary reflects the real end-of-turn state.
+  if (resolveCombatExhaustion(session)) return;
+
   let next = otherSeat(endingSeat);
   session.state.turn = Number(session.state.turn || 0) + 1;
   session.state.currentPlayer = next;
@@ -558,6 +665,17 @@ export function runBotTurn(session, botSeat) {
   startTurn(session, botSeat);
   if (session.status === 'finished') return;
   const p = ensurePlayer(session, botSeat);
+
+  // A practice bot can otherwise deadlock itself by filling all three persistent
+  // slots with Defense/traps while its hand/deck still contains cards. Humans can
+  // manually clear their field; give the bot the same escape hatch.
+  if (p.field.length >= FIELD_LIMIT() && p.hand.some(id => index.has(entryId(id)))) {
+    const firedIndex = p.field.findIndex(entry => Boolean(entry?._fired));
+    const removeIndex = firedIndex >= 0 ? firedIndex : 0;
+    const removedId = entryId(p.field[removeIndex]);
+    removeFieldCard(session, botSeat, removedId);
+    event(session, 'bot_field_cleared', { seat: botSeat, cardId: removedId });
+  }
 
   // Original practice behavior: play one available card, then pass the turn.
   // Prefer a non-trap so a bot turn visibly resolves; traps are still legal fallback plays.
